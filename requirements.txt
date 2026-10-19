@@ -1,0 +1,9 @@
+# Direct dependencies, pinned to the versions tested on Linux x86_64 / Python 3.13.
+# (rembg pulls in its own helpers such as pooch, pymatting, scikit-image; mediapipe pulls in opencv-contrib-python.)
+rembg==2.0.85
+onnxruntime==1.31.0
+numpy==2.5.4
+pillow==12.3.0
+opencv-python-headless==5.0.0.93
+opencv-contrib-python==5.0.0.93
+mediapipe==1.1.1

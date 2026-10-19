@@ -1,0 +1,8 @@
+.venv/
+models/
+out/
+webui-jobs/
+__pycache__/
+*.pyc
+*.pkl
+*.part
