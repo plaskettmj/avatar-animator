@@ -38,19 +38,52 @@ Use `avatar.webp` when the destination accepts WebP: it stays at 512 px and is u
 ### Prepare once, re-export fast
 
 The slow analysis (background removal, face and cat-eye detection) is cached in `<out>/prep/`. Run again with
-the same `-o` and it is reused, so changing `--eyes`, motions or `--set` values skips segmentation.
+the same `-o` and it is reused, so changing the eyes, motions or `--set` values skips segmentation.
 
 ```bash
 # 1. slow step only: mask, crop, background fill, eye detection (about 10 s cold, under 1 s when cached)
 .venv/bin/python animate.py my-photo.jpg --style pet -o out/me --prepare-only
-# -> out/me/prep/preview.png (crop with the detected eyes outlined and numbered), prep.json,
-#    subject.png + background.png (layers on the padded canvas)
-# 2. fix the eyes if needed (prep.json "eyes_arg" is in the same format), then export
-.venv/bin/python animate.py my-photo.jpg --style pet -o out/me --eyes "0.35,0.55,0.12,0.11;0.61,0.58,0.13,0.10"
+# -> out/me/prep/preview.png  crop with the detected eyes outlined, numbered and labelled cartoon/photo
+#    out/me/prep/grid.png     the same square with an A-J / 1-10 grid (for placing eyes from a chat)
+#    out/me/prep/mask.png     the cut-out: what moves as the subject is bright, the rest is dimmed
+#    out/me/prep/crop.png, subject.png, background.png, prep.json
+# 2. fix the eyes if needed, then export (prep/ is left as prepared; out/me/eyes.png shows the eyes used)
+.venv/bin/python animate.py my-photo.jpg --style pet -o out/me --eyes-at "D5,G5"
 ```
 
-`prep.json` also lists the crop as `--center`/`--zoom` values and which detector found the eyes
-(`eye_source`: face, pet, cartoon, manual or none). `--no-cache` turns the cache off.
+`prep.json` lists the eyes (`eyes[*].src` in source-image pixels, `eyes[*].box` in output fractions, `kind`),
+`eyes_src_arg` / `eyes_arg` strings you can pass back, the crop as `--center`/`--zoom` values, and which detector
+found the eyes (`eye_source`: face, pet, cartoon, manual or none). `--no-cache` turns the cache off.
+
+### Placing eyes by hand
+
+Three ways, all of which can be mixed:
+
+| flag | example | meaning |
+|---|---|---|
+| `--eyes-at` | `"D5,G5"` | cells of `prep/grid.png`. The eye's shape is found around each cell centre |
+| `--eyes-src` | `"365,470;605,470"` or `"365,470,120,130,cartoon"` | source-image pixels: a point (shape found automatically) or a box. Stays valid if the crop, zoom or style changes |
+| `--eyes` | `"0.36,0.46,0.12,0.14"` | fractions of the output square (tied to the current crop), optional `,cartoon` / `,photo` |
+
+Each eye blinks in one of two ways:
+
+* **cartoon**: the eye shape is lifted off the face and squashed shut. Right for mascots, logos, app icons and
+  drawings with outlined eyes.
+* **photo**: the skin above the eye slides down like an eyelid. Right for real faces and pets. On a cartoon it
+  drags the eyebrows into the eyes.
+
+`auto` (the default) picks cartoon when the eye's shape was found and the image is flat artwork (or the style
+is `logo`/`space`), otherwise photo. Force it per eye (`D5:cartoon`, `365,470,cartoon`) or for all eyes with
+`--eye-kind cartoon|photo`. Placing eyes turns blinking on even for styles that don't blink by default. Eyes the
+face detector finds on flat artwork are re-fitted as cartoon eyes automatically.
+
+**Chat flow for bots:** run `--prepare-only`, send the user `prep/grid.png`, ask which cells the eyes are in,
+then export with `--eyes-at "<cells>"`. Check `eyes.png` (or `report.json` → `eye_details[*].grabbed`) and
+send the result.
+
+**Cut-out model:** if `mask.png` shows parts missing from the subject (headsets, props, bodies), re-run with
+`--model birefnet-general` (about 30 s and up to 8 GB RAM the first time, cached after). Missing parts stay
+still and get smeared by the background fill when the subject moves.
 
 ## Styles
 
@@ -74,7 +107,10 @@ the same `-o` and it is reused, so changing `--eyes`, motions or `--set` values 
 | `--subject float,blink` | replace the style's subject motions (`float`, `breathe`, `tilt`, `blink`, `sweep`, or `none`) |
 | `--bg swirl,twinkle` | replace the background motions (`parallax`, `swirl`, `twinkle`, `sparkles`, `particles`, `sweep`, `hue`, `backdrop`, or `none`) |
 | `--blink auto\|face\|pet\|cartoon\|off` | eye detector to use for blinking (default `auto`) |
-| `--eyes "cx,cy,w,h;cx,cy,w,h"` | place the eyes by hand, as fractions of the output square (e.g. `"0.40,0.42,0.08,0.05;0.58,0.42,0.08,0.05"`) |
+| `--eyes "cx,cy,w,h[,kind];..."` | place the eyes by hand, as fractions of the output square (e.g. `"0.40,0.42,0.08,0.05;0.58,0.42,0.08,0.05"`) |
+| `--eyes-src "x,y[,w,h][,kind];..."` | place the eyes in source-image pixels; a bare point finds the eye's shape |
+| `--eyes-at "D5,G5"` | place the eyes by `prep/grid.png` cell (`D5:cartoon` to force the blink style) |
+| `--eye-kind auto\|cartoon\|photo` | blink style for eyes left on auto (see "Placing eyes by hand") |
 | `--seconds 3` / `--fps 20` | loop length and frame rate |
 | `--center 0.43,0.47` / `--zoom 1.4` | crop centre as fractions of the source image; zoom > 1 crops tighter |
 | `--size 512` | output size in px |
@@ -107,8 +143,10 @@ git clone https://github.com/plaskettmj/avatar-animator.git && cd avatar-animato
 ```
 
 Pick the style that matches the image (person: `portrait`, animal: `pet`, logo/icon: `logo`, illustration or
-space scene: `space`). Check `out/avatar/report.json`: if `eyes` is empty and the subject has eyes, rerun with
-`--eyes`, or use `--blink off`. Look at `contact-sheet.png` before uploading.
+space scene: `space`). Check `out/avatar/report.json`: if `eyes` is empty and the subject has eyes, send the
+user `out/avatar/prep/grid.png`, ask which cells the eyes are in and rerun with `--eyes-at "D5,G5"`, or use
+`--blink off`. For cartoons and logos, `eyes` should say `cartoon`: `photo` eyes on a drawing blink by sliding the
+eyebrows down (pass `--eye-kind cartoon`). Look at `contact-sheet.png` before uploading.
 
 ## Web UI (optional)
 
@@ -119,17 +157,23 @@ space scene: `space`). Check `out/avatar/report.json`: if `eyes` is empty and th
 This is a small local page, standard library only. Upload an image, pick a style or motions, then download the
 GIF/WebP and see 96/48/32 px previews. Jobs are stored in `webui-jobs/`. It listens on localhost only.
 
-It also has two JSON endpoints for editors and bots: `POST /prepare` (multipart upload, same fields as the form)
-runs only the slow step and returns the crop, the detected eyes and links to the preview and layer PNGs;
-`POST /export` with `{"job": ..., "eyes": "cx,cy,w,h;cx,cy,w,h"}` (plus optional `style`, `subject`, `bg`,
-`seconds`, `fps`, `blink`, `params`) renders from the job's cache. See the docstring at the top of `webui.py`.
+**Eye editor:** http://127.0.0.1:8765/editor. Choose an image, a style and a cut-out model (fast or full),
+then Prepare. Detected eyes are drawn on the cropped square. Click an eye to add it (its shape is found
+automatically), drag to move, drag the square handle to resize, Delete to remove, and pick cartoon/photo per
+eye. "Show cut-out" shows the mask; switching the cut-out model or style keeps your eyes. "Test blink" plays
+the real renderer closing the eyes in about a second; "Export" renders and encodes the loop.
+
+JSON endpoints for editors and bots (details in the docstring at the top of `webui.py`): `POST /prepare`
+(multipart upload, or JSON `{"job", "model", "style"}` to re-prepare a job), `POST /eyes` (resolve clicked
+points into eyes, optional blink test strip) and `POST /export` (eyes in source pixels or any CLI format).
 
 ## How it works
 
 ```
 image ─► subject mask (BiRefNet-lite via rembg) ─► square crop on the subject
       ─► layers: subject (RGBA) + background with the subject hole inpainted (OpenCV)
-      ─► eyes: MediaPipe face landmarks │ cat-face cascade │ cartoon-eye heuristic │ manual --eyes
+      ─► eyes: MediaPipe face landmarks │ cat-face cascade │ cartoon-eye heuristic │ manual (clicked point → shape)
+      ─► blink per eye: cartoon (squash the eye shape) │ photo (eyelid slide)
       ─► per-layer motions, all periodic in loop time t, so frame(t=1) == frame(t=0)
       ─► GIF (one global palette, optional gifsicle, auto-shrinks to fit) + WebP ─► contact sheet + report.json
 ```
@@ -140,13 +184,15 @@ image ─► subject mask (BiRefNet-lite via rembg) ─► square crop on the su
 ./run_tests.sh
 ```
 
-This runs the unit tests in `tests/` (prepare/export split, cache reuse, eye round-trip, CLI and web endpoints),
+This runs the unit tests in `tests/` (prepare/export split, cache reuse, eye round-trip, eye grabbing and blink
+styles, grid cells, CLI and web endpoints),
 then renders the four CC0 sample images in `test-images/` and checks the size budget and the seamless loop
 for each one.
 
 ## Limitations
 
-Frontal faces and cats blink. Dogs, profiles and sunglasses usually don't, so pass `--eyes` for those. Large
+Frontal faces, cats and most outlined cartoon eyes blink. Dogs, profiles and sunglasses usually don't, so place
+the eyes by hand (`--eyes-at`, `--eyes-src` or the editor) for those. Large
 moves can show smeary background fill. See [docs/ROADMAP.md](docs/ROADMAP.md) for known limitations and planned
 improvements.
 

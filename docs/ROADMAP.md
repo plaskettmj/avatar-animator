@@ -11,24 +11,38 @@
     tiny faces get no blink, and the tool skips it without failing.
   * Pets: a cat-face Haar cascade plus a colour-blob eye fit. It works on frontal cats with distinct eyes. There
     is no dog detector, so use `--eyes` for dogs.
-  * Cartoons: a heuristic that looks for two similar high-contrast blobs inside the subject. It can miss unusual
-    designs or misfire on two dots or buttons; `--blink off` disables it.
+  * Cartoons: a heuristic that looks for two similar high-contrast or strongly coloured blobs inside the subject.
+    It can miss unusual designs or misfire on two dots, buttons or laces; place the eyes by hand or use
+    `--blink off`. Manual and detected eyes on flat artwork use the cartoon squash blink.
+  * Clicked eyes: the shape is found from colour contrast with the surrounding face. Low-contrast eyes (closed,
+    painted, photographic) fall back to an ellipse you size by hand. Eyes outside the cut-out don't blink
+    visibly, because blinking only changes the subject layer.
 * **Swirl:** a flow crossfade rather than a rigid rotation, so the texture pulses slightly in sharpness. Tilted
   disks need `swirl_ratio`/`swirl_tilt` set by hand.
 * **Background fill:** OpenCV Telea inpainting at quarter resolution. It's fine for the small reveals the motions
-  make, but large moves show smeary fill.
+  make, but large moves show smeary fill. The fill band around the subject is visible even at rest, so parts the
+  cut-out misses (a headset next to a head) look smeared; use `--model birefnet-general` or, later, mask painting.
 * **Framing:** a heuristic crop (face box ×2.6, otherwise the subject bbox); `--center` and `--zoom` override it.
+  When the crop is larger than the image (app icons with the logo style, zoom < 1) the edge pixels are smeared
+  into the border; use `--center 0.5,0.5 --zoom 1` until crop drag (live-preview step 4) clamps it.
   Subjects that touch the image edge get their edge pixels replicated, and long replications can look streaky.
 * **Segmentation edges:** there's no colour decontamination, so a faint fringe of the old background can move with
   the subject on high-contrast edges.
 * **Motion is rigid:** float, tilt and breathe, plus blink. There is no mesh warping or gaze movement yet.
 
 ## Roadmap
-1. Live preview in the browser (in progress). Step 1 is done: the slow prepare step (mask, crop, fill, eyes) is
-   split from export and cached per output folder / web job (`--prepare-only`, `/prepare`, `/export`). Next: send the layers once (subject PNG, filled background, eye data) and animate them
-   client-side with Canvas/WebGL using the same periodic motion functions. Sliders then update instantly, and
-   encoding happens only on export.
-2. Manual corrections: drag the crop square, paint the mask, click to place eyes, draw the swirl ellipse.
+1. Live preview in the browser (in progress).
+   * Step 1 (done): the slow prepare step (mask, crop, fill, eyes) is split from export and cached per output
+     folder / web job (`--prepare-only`, `/prepare`, `/export`).
+   * Step 2 (done): eye editor. Chat path (`prep/grid.png` + `--eyes-at`) and browser editor (`/editor`: click
+     to add, drag, resize, per-eye cartoon/photo blink, test blink, cut-out view and model switch). Eyes are
+     stored in source-image pixels; clicked points grab the eye shape.
+   * Step 3 (next): animate the layers client-side with Canvas using the same periodic motion functions, so
+     sliders update instantly and encoding happens only on export. The editor's "Test blink" currently asks the
+     server for a short strip of real frames.
+   * Step 4: crop drag and zoom, clamped to the image so the border is never smeared.
+   * Step 5: template skill wiring, docs, golden tests.
+2. Manual corrections: drag the crop square (step 4), paint the mask, draw the swirl ellipse.
 3. Permissive model upgrades: BiRefNet full/HR (MIT) for hair, LaMa (Apache-2.0) for background fill, MediaPipe
    iris/blendshapes for gaze, and a permissively licensed pet keypoint model for dogs.
 4. Export options: APNG, MP4/WebM loops, a small sidebar-optimised variant with stronger motion, and a size-budget
