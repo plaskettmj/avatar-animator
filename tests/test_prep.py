@@ -134,7 +134,9 @@ class PrepTests(unittest.TestCase):
         self.assertEqual(rep["eyes_arg"], "0.4000,0.4500,0.1000,0.0600;0.6000,0.4500,0.1000,0.0600")
         self.assertTrue(rep["gif"]["seam_ok"] and rep["webp"]["seam_ok"] and rep["periodic_t1_equals_t0"])
         self.assertTrue(os.path.isfile(os.path.join(out, "avatar.gif")))
-        self.assertEqual(load_json(os.path.join(out, "prep", "prep.json"))["eye_source"], "manual")
+        self.assertTrue(os.path.isfile(os.path.join(out, "eyes.png")))
+        # export leaves prep/ as prepare wrote it: the auto-detected eyes are still there
+        self.assertEqual(load_json(os.path.join(out, "prep", "prep.json")), prep)
 
     def test_parse_eyes(self):
         self.assertEqual(animate.parse_eyes("0.1,0.2,0.3,0.4;0.5,0.6,0.7,0.8"), [(0.1, 0.2, 0.3, 0.4), (0.5, 0.6, 0.7, 0.8)])

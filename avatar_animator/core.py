@@ -1,5 +1,5 @@
 """Avatar animator core: segmentation, layering, motion presets, rendering."""
-import hashlib, json, math, os
+import hashlib, json, math, os, re
 import numpy as np, cv2
 from PIL import Image
 
@@ -71,6 +71,10 @@ def segment(img_rgb_u8, model="birefnet-general-lite"):
     """Return soft subject mask in [0,1] (float32) using rembg (MIT) + chosen weights."""
     from rembg import new_session, remove
     if model not in _sessions:
+        # keep one model in memory: the full BiRefNet peaks around 8 GB, so holding the lite one as well
+        # (e.g. the web editor switching cut-out models) can exhaust a 16 GB machine
+        _sessions.clear()
+        import gc; gc.collect()
         _sessions[model] = new_session(model)
     m = remove(Image.fromarray(img_rgb_u8), session=_sessions[model], only_mask=True)
     return np.asarray(m).astype(np.float32) / 255.0
@@ -118,7 +122,10 @@ def detect_cartoon_eyes(img, mask):
     m = cv2.erode(m, np.ones((5, 5), np.uint8))
     lum = img.mean(2)
     med = np.median(lum[m > 0])
-    cand = ((np.abs(lum - med) > 0.45) & (m > 0)).astype(np.uint8)
+    # brightness contrast, or a strong colour shift (cyan eyes on a white helmet have similar brightness)
+    labc = cv2.cvtColor((np.clip(img, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    chroma = np.linalg.norm(labc[..., 1:] - np.median(labc[m > 0][:, 1:], 0), axis=2)
+    cand = (((np.abs(lum - med) > 0.45) | (chroma > 30)) & (m > 0)).astype(np.uint8)
     n, lab, st, cen = cv2.connectedComponentsWithStats(cand)
     area_s = m.sum()
     comps = []
@@ -126,7 +133,7 @@ def detect_cartoon_eyes(img, mask):
         x, y, w, h, a = st[i]
         if not (0.003 * area_s < a < 0.12 * area_s):
             continue
-        if a / float(w * h) < 0.45:
+        if a / float(w * h) < 0.35:   # wedge-shaped eyes fill about 40% of their box
             continue
         comps.append((i, cen[i], a, w, h))
     best = None
@@ -201,6 +208,112 @@ def eyes_from_boxes(boxes, E):
         eyes.append(dict(kind="photo", poly=poly))
     return eyes
 
+EYE_KINDS = ("auto", "cartoon", "photo")
+ILLUSTRATION_THRESHOLD = 0.85   # illustration_score at or above this counts as flat artwork (cartoon blink)
+
+def illustration_score(img_rgb_u8):
+    """Share of pixels covered by the 12 most common coarse colours (RGB in steps of 32). Flat artwork
+    (cartoons, logos, app icons) scores about 0.9-1.0, photos about 0.6-0.7."""
+    small = cv2.resize(np.ascontiguousarray(img_rgb_u8), (512, 512), interpolation=cv2.INTER_NEAREST)
+    q = (small // 32).reshape(-1, 3).astype(np.int32)
+    c = np.bincount(q[:, 0] * 64 + q[:, 1] * 8 + q[:, 2], minlength=512)
+    return float(np.sort(c)[::-1][:12].sum() / c.sum())
+
+def _grab_once(img, cx, cy, hw, hh, out, reach):
+    """One pass of grab_eye in a window of half-size (hw, hh) around (cx, cy). Returns (blob, d, thr, x0, y0,
+    touches_edge) or None. blob is the chosen component (uint8, window-sized)."""
+    x0, x1 = int(max(cx - hw, 0)), int(min(cx + hw + 1, img.shape[1]))
+    y0, y1 = int(max(cy - hh, 0)), int(min(cy + hh + 1, img.shape[0]))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    win = (np.clip(img[y0:y1, x0:x1], 0, 1) * 255).astype(np.uint8)
+    lab = cv2.cvtColor(win, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ring = np.concatenate([lab[:2].reshape(-1, 3), lab[-2:].reshape(-1, 3),
+                           lab[:, :2].reshape(-1, 3), lab[:, -2:].reshape(-1, 3)])
+    d = np.linalg.norm(lab - np.median(ring, 0), axis=2)
+    otsu, _ = cv2.threshold(np.clip(d * 2, 0, 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr = max(otsu / 2, 22.0)
+    cand = cv2.morphologyEx((d > thr).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab_, st, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    px, py = cx - x0, cy - y0
+    H, W = cand.shape
+    best = None
+    for i in range(1, n):
+        bx, by, bw, bh, a = st[i]
+        if not (0.0012 * out * out <= a <= 0.06 * out * out):
+            continue
+        if (bx == 0) + (by == 0) + (bx + bw == W) + (by + bh == H) >= 3:
+            continue   # a region that fills the window is background, not an eye
+        ci = (lab_[by:by + bh, bx:bx + bw] == i).astype(np.uint8)
+        cs, _ = cv2.findContours(ci, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        hull = cv2.convexHull(np.concatenate(cs) + np.array([bx, by], np.int32))
+        # signed distance from the point to the blob's hull: > 0 inside. A blob that surrounds the point (the
+        # eye outline around the iris) wins over a small one next to it (a pupil or highlight), then the biggest.
+        sd = cv2.pointPolygonTest(hull, (float(px), float(py)), True)
+        key = (0, 0.0, -a) if sd >= 0 else (1, -sd, -a)
+        if -sd <= reach and (best is None or key < best[0]):
+            best = (key, i)
+    if best is None:
+        return None
+    bx, by, bw, bh, _ = st[best[1]]
+    touches = ((bx == 0 and x0 > 0) or (by == 0 and y0 > 0) or
+               (bx + bw == W and x1 < img.shape[1]) or (by + bh == H and y1 < img.shape[0]))
+    return (lab_ == best[1]).astype(np.uint8), d, thr, x0, y0, touches
+
+def grab_eye(img, cx, cy, out, box=None):
+    """Find the shape of the eye at a clicked point (canvas px) in an RGB float image.
+
+    The colour around the edge of a search window is taken as the face colour; pixels far from it (Lab
+    distance, Otsu) form candidate blobs, and the blob around (or nearest) the point, holes filled and convex
+    hull taken, is the eye. If the blob runs into the window edge (an off-centre click), the window is moved
+    onto it and enlarged. box=(w, h) limits the window to about 1.3x that size. Returns (mask uint8 same size
+    as img, info) or (None, info) when nothing eye-like is there."""
+    hw, hh = (max(box[0] * 0.65, 4), max(box[1] * 0.65, 4)) if box else (0.12 * out, 0.12 * out)
+    reach = (0.5 * max(box) if box else 0.04 * out) + 2
+    r = _grab_once(img, cx, cy, hw, hh, out, reach)
+    for _ in range(2):
+        if r is None or not r[5] or box:
+            break
+        m, _, _, x0, y0, _ = r
+        ys, xs = np.nonzero(m)
+        ncx, ncy = x0 + (xs.min() + xs.max()) / 2, y0 + (ys.min() + ys.max()) / 2
+        hw, hh = hw * 1.5, hh * 1.5
+        r2 = _grab_once(img, ncx, ncy, hw, hh, out, reach)
+        if r2 is None:
+            break
+        r = r2
+    if r is None:
+        return None, dict(found=False)
+    m, d, thr, x0, y0, _ = r
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hull = cv2.convexHull(max(cs, key=cv2.contourArea))
+    filled = np.zeros_like(m)
+    cv2.drawContours(filled, [hull], -1, 1, -1)
+    info = dict(found=True, solidity=round(float(m.sum()) / max(float(filled.sum()), 1.0), 3),
+                contrast=round(float(d[m > 0].mean() / thr), 2))
+    filled = cv2.dilate(filled, np.ones((3, 3), np.uint8))   # take in the anti-aliased outline
+    full = np.zeros(img.shape[:2], np.uint8)
+    full[y0:y0 + m.shape[0], x0:x0 + m.shape[1]] = filled
+    return full, info
+
+def parse_eye_spec(s, space="src"):
+    """'x,y[,w,h][,kind]' -> eye spec dict. space='src': source-image px; space='out': fractions of the output square."""
+    toks = [t.strip() for t in s.replace(":", ",").split(",") if t.strip()]
+    kind = "auto"
+    if toks and not re.fullmatch(r"[-+0-9.eE]+", toks[-1]):
+        kind = toks.pop().lower()
+    if kind not in EYE_KINDS:
+        raise ValueError(f"eye kind must be one of {EYE_KINDS}, got {kind!r}")
+    v = [float(t) for t in toks]
+    if len(v) not in (2, 4):
+        raise ValueError(f"an eye needs x,y or x,y,w,h (plus an optional kind), got {s!r}")
+    return dict(x=v[0], y=v[1], w=v[2] if len(v) == 4 else None, h=v[3] if len(v) == 4 else None,
+                kind=kind, space=space)
+
+def format_eye_specs(specs):
+    """Eye specs (source px) -> the --eyes-src string 'x,y,w,h,kind;...'."""
+    return ";".join(f"{e['x']:.1f},{e['y']:.1f},{e['w']:.1f},{e['h']:.1f},{e['kind']}" for e in specs)
+
 # ----------------------------------------------------------------- slow analysis (cacheable)
 ANALYSIS_VERSION = 1
 
@@ -239,9 +352,9 @@ class Analysis:
                         os.remove(os.path.join(cache_dir, f))
                 self._save()
 
-    @staticmethod
-    def _note(lst, what):
-        if what not in lst:
+    def _note(self, lst, what):
+        # a step computed in this run is a miss; later in-memory reuse of it is not also a cache hit
+        if what not in lst and not (lst is self.hits and what in self.misses):
             lst.append(what)
 
     def _save(self):
@@ -322,12 +435,18 @@ def tri(p):
 class Animator:
     def __init__(self, src_rgb, out=512, style="portrait", subject=None, bg=None, seconds=3.0, fps=20,
                  model="birefnet-general-lite", center=None, zoom=1.0, eyes=None, blink="auto",
-                 seed=7, params=None, log=print, analysis=None):
+                 seed=7, params=None, log=print, analysis=None, eye_kind="auto"):
+        """eyes: manual eyes, as a list of eye specs (dicts from parse_eye_spec: x, y, optional w, h, kind and
+        space 'src' = source-image px or 'out' = fractions of the output square) or, as before, (cx, cy, w, h)
+        tuples in output fractions (an optional 5th item is the kind). Specs without w/h are grabbed: the eye
+        shape around the point is found automatically. eye_kind: blink style for eyes whose kind is 'auto'."""
         self.log = log
         self.P = dict(DEFAULTS); self.P.update(params or {})
         st = STYLES.get(style, STYLES["portrait"])
         self.subj = list(subject if subject is not None else st["subject"])
         self.bgm = list(bg if bg is not None else st["bg"])
+        if eyes and "blink" not in self.subj:
+            self.subj.append("blink")   # placing eyes by hand means "make these blink", whatever the style
         self.style = style
         self.out, self.fps, self.seconds = out, fps, seconds
         self.N = int(round(fps * seconds))
@@ -384,6 +503,7 @@ class Animator:
         # --- extract extended canvas E x E (margin around the visible square)
         s = out / side
         M = np.float32([[s, 0, E / 2 - s * cx], [0, s, E / 2 - s * cy]])
+        self.M, self.scale, self.src_size = M, s, (W0, H0)
         srcf = src.astype(np.float32) / 255
         self.img = cv2.warpAffine(srcf, M, (E, E), flags=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC,
                                   borderMode=cv2.BORDER_REPLICATE)
@@ -416,17 +536,20 @@ class Animator:
 
         # --- eyes in canvas coords
         self.eyes = []
+        self.illustration = illustration_score(analysis.work)
+        self.eye_kind = eye_kind if eye_kind in EYE_KINDS else "auto"
         if "blink" in self.subj:
             if eyes:
-                self.eyes = eyes_from_boxes([(self.off + x * out, self.off + y * out, w * out, h * out)
-                                             for (x, y, w, h) in eyes], E)
-                for e in self.eyes:
-                    e["src"] = "manual"
+                for spec in eyes:
+                    if not isinstance(spec, dict):
+                        spec = dict(x=spec[0], y=spec[1], w=spec[2], h=spec[3],
+                                    kind=spec[4] if len(spec) > 4 else "auto", space="out")
+                    self.eyes.append(self._resolve_eye(spec, "manual"))
             if face_eyes and not self.eyes:
                 for e in face_eyes:
                     p = e["poly"] / sc
                     p = np.stack([s * p[:, 0] + M[0, 2], s * p[:, 1] + M[1, 2]], 1)
-                    self.eyes.append(dict(kind="photo", poly=p.astype(np.float32)))
+                    self.eyes.append(dict(kind="photo", poly=p.astype(np.float32), src="face"))
             if not self.eyes and blink in ("auto", "pet"):
                 for p in analysis.pet():
                     p = p / sc
@@ -434,6 +557,28 @@ class Animator:
                     self.eyes.append(dict(kind="photo", poly=p.astype(np.float32), src="pet"))
             if not self.eyes and blink in ("auto", "cartoon"):
                 self.eyes = detect_cartoon_eyes(self.img, self.mask)
+                for e in self.eyes:
+                    e["src"] = "cartoon"
+            # Detected photo-style eyes on flat artwork (MediaPipe often finds cartoon faces, but its eye
+            # outlines are slivers there), or a forced eye_kind: re-fit them as clicked points.
+            if self.eyes and self.eyes[0]["src"] != "manual":
+                want, guessed = self.eye_kind, False
+                if want == "auto" and self.illustration >= ILLUSTRATION_THRESHOLD and self.eyes[0]["kind"] == "photo":
+                    want, guessed = "cartoon", True
+                if want == "auto" and self.eyes[0]["src"] == "cartoon":
+                    want, guessed = "cartoon", True   # re-grab: the detector's blobs are eroded / partial
+                if want != "auto" and (guessed or any(e["kind"] != want for e in self.eyes)):
+                    refit = []
+                    for e in self.eyes:
+                        x0, y0, x1, y1 = self._canvas_bbox(e)
+                        r = self._resolve_eye(dict(x=(x0 + x1) / 2, y=(y0 + y1) / 2, kind=want, space="canvas"),
+                                              e["src"], fallback_box=(x1 - x0, y1 - y0))
+                        refit.append(r)
+                    if not guessed or all(r["grab"]["found"] for r in refit):
+                        self.eyes = refit
+        for e in self.eyes:
+            e.setdefault("spec", self._spec_from_canvas(e))
+        self.eyes.sort(key=lambda e: e["spec"]["x"])   # eye 1 = leftmost in the image
         self.log(f"  crop center=({cx:.0f},{cy:.0f}) side={side:.0f}px  subject cover={self.mask_cover:.2f} "
                  f"anchored={self.anchored}  eyes={len(self.eyes)} ({self.eyes[0]['kind'] if self.eyes else 'none'})")
         if "blink" in self.subj and not self.eyes:
@@ -452,26 +597,105 @@ class Animator:
         self._prep_swirl()
         self._prep_sparkles()
 
-    # ------------------------------------------------------------ inspection
+    # ------------------------------------------------------------ eyes
+    def src_to_canvas(self, x, y):
+        return self.scale * x + self.M[0, 2], self.scale * y + self.M[1, 2]
+
+    def canvas_to_src(self, x, y):
+        return (x - self.M[0, 2]) / self.scale, (y - self.M[1, 2]) / self.scale
+
+    @staticmethod
+    def _canvas_bbox(e):
+        if e["kind"] == "cartoon":
+            ys, xs = np.nonzero(e["mask"])
+            return float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)
+        (x0, y0), (x1, y1) = e["poly"].min(0), e["poly"].max(0)
+        return float(x0), float(y0), float(x1), float(y1)
+
+    def _spec_from_canvas(self, e):
+        x0, y0, x1, y1 = self._canvas_bbox(e)
+        cx, cy = self.canvas_to_src((x0 + x1) / 2, (y0 + y1) / 2)
+        return dict(x=round(float(cx), 1), y=round(float(cy), 1), w=round(float(x1 - x0) / self.scale, 1),
+                    h=round(float(y1 - y0) / self.scale, 1), kind=e["kind"])
+
+    def _resolve_eye(self, spec, src, fallback_box=None):
+        """Eye spec -> internal eye (canvas coords). Cartoon eyes get a shape mask (grabbed from the image, or
+        the box's ellipse when nothing is found); photo eyes get an ellipse outline for the eyelid slide."""
+        out, E = self.out, self.E
+        space = spec.get("space", "src")
+        w, h = spec.get("w"), spec.get("h")
+        if space == "out":
+            cx, cy = self.off + spec["x"] * out, self.off + spec["y"] * out
+            w, h = (w * out if w else None), (h * out if h else None)
+        elif space == "canvas":
+            cx, cy = spec["x"], spec["y"]
+        else:
+            cx, cy = self.src_to_canvas(spec["x"], spec["y"])
+            w, h = (w * self.scale if w else None), (h * self.scale if h else None)
+        box = (w, h) if w and h else None
+        given = box is not None   # a sized eye keeps its position and size; only its shape is grabbed inside
+        kind = spec.get("kind") or "auto"
+        if kind == "auto":
+            kind = self.eye_kind
+        grabbed, info = (None, dict(found=False))
+        if kind != "photo" or box is None:
+            grabbed, info = grab_eye(self.img, cx, cy, out, box)
+        if kind == "auto":
+            flat = self.style in ("logo", "space") or self.illustration >= ILLUSTRATION_THRESHOLD
+            kind = "cartoon" if grabbed is not None and flat else "photo"
+        if box is None:
+            if grabbed is not None:
+                ys, xs = np.nonzero(grabbed)
+                x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+                cx, cy, box = (x0 + x1) / 2, (y0 + y1) / 2, (float(x1 - x0), float(y1 - y0))
+            else:
+                box = fallback_box or (0.10 * out, 0.065 * out)
+        if kind == "cartoon":
+            m = grabbed
+            if m is None:
+                m = np.zeros((E, E), np.uint8)
+                cv2.ellipse(m, (int(round(cx)), int(round(cy))), (max(int(box[0] / 2), 2), max(int(box[1] / 2), 2)),
+                            0, 0, 360, 1, -1)
+            e = dict(kind="cartoon", mask=m)
+        else:
+            e = eyes_from_boxes([(cx, cy, box[0], box[1])], E)[0]
+        e["src"], e["grab"] = src, info
+        if given:
+            sx, sy = self.canvas_to_src(cx, cy)
+            e["spec"] = dict(x=round(float(sx), 1), y=round(float(sy), 1), w=round(float(box[0] / self.scale), 1),
+                             h=round(float(box[1] / self.scale), 1), kind=kind)
+        return e
+
     def eye_boxes(self):
         """Eyes as (cx, cy, w, h) fractions of the output square: the same format as --eyes / run(eyes=...)."""
         boxes = []
         for e in self.eyes:
-            if e["kind"] == "cartoon":
-                ys, xs = np.nonzero(e["mask"])
-                x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
-            else:
-                x0, y0 = e["poly"].min(0); x1, y1 = e["poly"].max(0)
+            x0, y0, x1, y1 = self._canvas_bbox(e)
             boxes.append(tuple(round(float(v), 4) for v in (
                 ((x0 + x1) / 2 - self.off) / self.out, ((y0 + y1) / 2 - self.off) / self.out,
                 (x1 - x0) / self.out, (y1 - y0) / self.out)))
         return boxes
 
+    def eye_specs(self):
+        """Eyes in source-image px with their blink style: dicts x, y, w, h, kind (the --eyes-src format).
+        These stay valid when the crop, zoom, size or style changes."""
+        return [dict(e["spec"]) for e in self.eyes]
+
     def eye_source(self):
         """Which detector produced the eyes: manual, face, pet, cartoon or none."""
         if not self.eyes:
             return "none"
-        return self.eyes[0].get("src", self.eyes[0]["kind"] if self.eyes[0]["kind"] == "cartoon" else "face")
+        return self.eyes[0].get("src", "face")
+
+    def still(self, b=0.0):
+        """Rest pose (t=0 background, untransformed subject) with the eyes closed by b in [0, 1], as uint8.
+        Used for the editor's 'Test blink' without rendering or encoding a loop."""
+        rgb = self.apply_blink(self.fg, b) if (self.eyes and b > 0) else self.fg
+        bg = self.background(0.0)
+        a3 = self.alpha[..., None]
+        f = bg * (1 - a3) + rgb * a3 if self.sbox is not None else bg
+        o = self.off
+        return (np.clip(f[o:o + self.out, o:o + self.out], 0, 1) * 255 + 0.5).astype(np.uint8)
 
     # ------------------------------------------------------------ preparation
     def _prep_backdrop(self):

@@ -1,0 +1,189 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>Avatar animator: eye editor</title>
+<style>
+body{font-family:system-ui;max-width:1040px;margin:1.5em auto;background:#111;color:#eee}
+a{color:#8cf} button,select,input{font:inherit} button{padding:.3em .8em;margin:.15em}
+#wrap{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+#cv{width:512px;height:512px;max-width:100%;border-radius:10px;background:#222;cursor:crosshair;touch-action:none}
+#side{flex:1;min-width:300px} .eye{padding:.35em;border:1px solid #333;border-radius:6px;margin:.3em 0}
+.eye.sel{border-color:#0ef} .muted{color:#999;font-size:.9em} #status{min-height:1.4em;color:#fd6}
+.av{width:96px;height:96px;border-radius:50%;object-fit:cover;margin-right:8px;vertical-align:middle}
+fieldset{border:1px solid #444;margin:.5em 0}
+</style>
+<h1>Eye editor</h1>
+<fieldset><legend>1. Image</legend>
+<input type=file id=file accept=image/*>
+Style <select id=style><option>portrait</option><option>pet</option><option>logo</option><option>space</option></select>
+Cut-out <select id=model><option value=birefnet-general-lite>fast (lite)</option><option value=birefnet-general>full (slower, keeps props)</option></select>
+<button id=prep>Prepare</button>
+</fieldset>
+<div id=status></div>
+<div id=wrap>
+ <canvas id=cv width=512 height=512></canvas>
+ <div id=side>
+  <p class=muted>Click an eye to add it: its shape is found automatically. Drag an eye to move it, drag its square
+  handle to resize, press Delete to remove the selected eye. Positions are kept in source-image pixels, so they
+  survive a style or cut-out change.</p>
+  <label><input type=checkbox id=showmask> Show cut-out</label> <span class=muted>(bright = moves as the subject)</span><br>
+  <label><input type=checkbox id=noblink> No blink</label>
+  <div id=eyes></div>
+  <p><button id=test>Test blink</button> <button id=export>Export GIF + WebP</button> <button id=reset>Use detected eyes</button></p>
+  <div id=result></div>
+ </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+let job = null, prep = null, eyes = [], sel = -1, imgCrop = new Image(), imgMask = new Image(), drag = null, playing = false;
+const KINDS = ["auto", "cartoon", "photo"];
+const COL = {cartoon: "#00e6ff", photo: "#ffe600", auto: "#ccc"};
+function status(t) { $("status").textContent = t || ""; }
+async function post(url, body, isForm) {
+  const r = await fetch(url, isForm ? {method: "POST", body} :
+    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+// source px <-> canvas px for the current crop
+function k() { return prep.size / prep.crop.side; }
+function toC(x, y) { return [(x - (prep.crop.cx - prep.crop.side / 2)) * k(), (y - (prep.crop.cy - prep.crop.side / 2)) * k()]; }
+function toS(x, y) { return [x / k() + prep.crop.cx - prep.crop.side / 2, y / k() + prep.crop.cy - prep.crop.side / 2]; }
+function evPos(ev) { const r = cv.getBoundingClientRect(); return [(ev.clientX - r.left) * cv.width / r.width, (ev.clientY - r.top) * cv.height / r.height]; }
+function load(img, url) { return new Promise(res => { img.onload = res; img.src = url + "?t=" + Date.now(); }); }
+
+function draw() {
+  if (playing) return;
+  ctx.clearRect(0, 0, 512, 512);
+  if (!prep) return;
+  ctx.drawImage($("showmask").checked ? imgMask : imgCrop, 0, 0, 512, 512);
+  eyes.forEach((e, i) => {
+    const [cx, cy] = toC(e.x, e.y), w = e.w * k(), h = e.h * k();
+    ctx.strokeStyle = COL[e.kind] || "#fff"; ctx.lineWidth = i === sel ? 3 : 2;
+    ctx.setLineDash(e.outline ? [5, 4] : []);
+    ctx.beginPath(); ctx.ellipse(cx, cy, Math.max(w / 2, 2), Math.max(h / 2, 2), 0, 0, 2 * Math.PI); ctx.stroke();
+    ctx.setLineDash([]);
+    if (e.outline) { ctx.beginPath(); e.outline.forEach(([x, y], j) => { const [px, py] = toC(x, y); j ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }); ctx.closePath(); ctx.stroke(); }
+    ctx.fillStyle = ctx.strokeStyle; ctx.fillRect(cx + w / 2 - 5, cy + h / 2 - 5, 10, 10);   // resize handle
+    ctx.font = "bold 14px system-ui"; ctx.lineWidth = 3; ctx.strokeStyle = "#000";
+    const label = `${i + 1} ${e.kind}`; ctx.strokeText(label, cx + w / 2 + 6, cy - h / 2); ctx.fillText(label, cx + w / 2 + 6, cy - h / 2);
+  });
+  renderList();
+}
+function renderList() {
+  $("eyes").innerHTML = eyes.length ? "" : '<p class=muted>No eyes yet: click on each eye in the picture.</p>';
+  eyes.forEach((e, i) => {
+    const d = document.createElement("div"); d.className = "eye" + (i === sel ? " sel" : "");
+    d.innerHTML = `<b>Eye ${i + 1}</b> blink <select>${KINDS.map(x => `<option ${x === (e.want || e.kind) ? "selected" : ""}>${x}</option>`).join("")}</select>
+      <button>delete</button> <span class=muted>${Math.round(e.x)},${Math.round(e.y)} ${Math.round(e.w)}×${Math.round(e.h)} px${e.grabbed ? " · shape found" : ""}</span>`;
+    d.querySelector("select").onchange = ev => { e.want = ev.target.value; sel = i; resolve(); };
+    d.querySelector("button").onclick = () => { eyes.splice(i, 1); sel = -1; draw(); };
+    d.onclick = () => { sel = i; draw(); };
+    $("eyes").appendChild(d);
+  });
+}
+// ask the server to grab shapes / pick blink styles; keep user-set kinds
+async function resolve(test) {
+  const selObj = eyes[sel];
+  eyes.sort((a, b) => a.x - b.x);   // the server numbers eyes left to right
+  sel = selObj ? eyes.indexOf(selObj) : -1;
+  const body = {job, eyes: eyes.map(e => ({x: e.x, y: e.y, w: e.w || null, h: e.h || null, kind: e.want || "auto"})), test_blink: !!test};
+  const r = await post("/eyes", body);
+  eyes = r.eyes.map((e, i) => Object.assign(e, {want: (eyes[i] && eyes[i].want) || "auto"}));
+  // the server sorts eyes left to right; keep the selection on the same eye where possible
+  draw();
+  return r;
+}
+async function setPrep(r, keepEyes) {
+  job = r.job; prep = r.prep;
+  await Promise.all([load(imgCrop, r.urls["prep/crop.png"]), load(imgMask, r.urls["prep/mask.png"])]);
+  if (!keepEyes) eyes = prep.eyes.map(e => Object.assign({}, e.src, {kind: e.kind, want: "auto", grabbed: e.grabbed}));
+  sel = -1; draw();
+  if (keepEyes && eyes.length) await resolve();
+  status(`Prepared in ${prep.prep_s} s · eyes from: ${prep.eye_source} · cut-out: ${prep.model}`);
+}
+$("prep").onclick = async () => {
+  const f = $("file").files[0];
+  try {
+    if (f) {
+      const fd = new FormData(); fd.append("image", f); fd.append("style", $("style").value); fd.append("model", $("model").value);
+      status("Preparing (cut-out + eye detection; 10-45 s the first time)..."); $("file").value = "";
+      await setPrep(await post("/prepare", fd, true), false);
+    } else if (job) {
+      status("Re-preparing..."); await setPrep(await post("/prepare", {job, style: $("style").value, model: $("model").value}), true);
+    } else status("Choose an image first.");
+  } catch (e) { status("Failed: " + e.message); }
+};
+$("model").onchange = $("style").onchange = () => { if (job) $("prep").onclick(); };
+$("showmask").onchange = draw;
+$("reset").onclick = () => { if (!prep) return; eyes = prep.eyes.map(e => Object.assign({}, e.src, {kind: e.kind, want: "auto", grabbed: e.grabbed})); sel = -1; draw(); };
+
+function hit(x, y) {
+  for (let i = eyes.length - 1; i >= 0; i--) {
+    const e = eyes[i], [cx, cy] = toC(e.x, e.y), w = e.w * k(), h = e.h * k();
+    if (Math.abs(x - (cx + w / 2)) < 8 && Math.abs(y - (cy + h / 2)) < 8) return [i, "resize"];
+    if (((x - cx) / (w / 2 + 3)) ** 2 + ((y - cy) / (h / 2 + 3)) ** 2 <= 1) return [i, "move"];
+  }
+  return [-1, null];
+}
+cv.onpointerdown = async ev => {
+  if (!prep || playing) return;
+  const [x, y] = evPos(ev), [i, mode] = hit(x, y);
+  if (i >= 0) { sel = i; const e = eyes[i]; drag = {i, mode, x, y, ex: e.x, ey: e.y, ew: e.w, eh: e.h, moved: false}; cv.setPointerCapture(ev.pointerId); draw(); return; }
+  const [sx, sy] = toS(x, y);
+  const added = {x: sx, y: sy, w: null, h: null, kind: "auto", want: "auto"};
+  eyes.push(added); sel = eyes.length - 1;
+  status("Finding the eye shape...");
+  try { await resolve(); status(eyes[sel] && eyes[sel].grabbed ? "Eye added (shape found)." : "Eye added (no clear shape found: drag the handle to size it)."); }
+  catch (e) { eyes.splice(eyes.indexOf(added), 1); sel = -1; status("Failed: " + e.message); }
+  draw();
+};
+cv.onpointermove = ev => {
+  if (!drag) { const [x, y] = evPos(ev), [, m] = prep ? hit(x, y) : [-1, null]; cv.style.cursor = m === "resize" ? "nwse-resize" : m ? "move" : "crosshair"; return; }
+  const [x, y] = evPos(ev), e = eyes[drag.i], dx = (x - drag.x) / k(), dy = (y - drag.y) / k();
+  drag.moved = true;
+  if (drag.mode === "move") { e.x = drag.ex + dx; e.y = drag.ey + dy; }
+  else { e.w = Math.max(6, drag.ew + 2 * dx); e.h = Math.max(4, drag.eh + 2 * dy); }
+  e.outline = null; draw();
+};
+cv.onpointerup = async () => {
+  if (drag && drag.moved) { drag = null; try { await resolve(); } catch (e) { status("Failed: " + e.message); } }
+  drag = null;
+};
+document.onkeydown = ev => {
+  if ((ev.key === "Delete" || ev.key === "Backspace") && sel >= 0 && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
+    eyes.splice(sel, 1); sel = -1; draw(); ev.preventDefault();
+  }
+};
+$("test").onclick = async () => {
+  if (!job) return;
+  if (!eyes.length) return status("Add at least one eye first.");
+  status("Rendering blink test...");
+  try {
+    const r = await resolve(true), strip = new Image();
+    await new Promise(res => { strip.onload = res; strip.src = r.urls.blink; });
+    playing = true; const n = r.frames, s = r.size;
+    const seq = [...Array(n).keys(), 0, 0, 0];
+    for (let rep = 0; rep < 2; rep++) for (const f of seq) {
+      ctx.drawImage(strip, f * s, 0, s, s, 0, 0, 512, 512); await new Promise(res => setTimeout(res, 70));
+    }
+    playing = false; draw(); status("Blink test done. This is the real renderer at rest pose; Export makes the full loop.");
+  } catch (e) { playing = false; status("Failed: " + e.message); }
+};
+$("export").onclick = async () => {
+  if (!job) return;
+  status("Exporting (rendering + GIF/WebP encoding, about 40-60 s)...");
+  try {
+    const r = await post("/export", {job, no_blink: $("noblink").checked,
+      eyes: $("noblink").checked ? [] : eyes.map(e => ({x: e.x, y: e.y, w: e.w, h: e.h, kind: e.kind}))});
+    const t = "?t=" + Date.now(), rep = r.report, u = r.urls;
+    $("result").innerHTML = `<p><img class=av src="${u["avatar.gif"]}${t}"><img class=av style="width:48px;height:48px" src="${u["avatar.webp"]}${t}">
+      <img class=av style="width:32px;height:32px" src="${u["avatar.gif"]}${t}"></p>
+      <p><a download href="${u["avatar.gif"]}">avatar.gif</a> (${rep.gif.size_mb} MB) · <a download href="${u["avatar.webp"]}">avatar.webp</a> (${rep.webp.size_mb} MB)
+      · eyes: ${rep.eyes.join(", ") || "none"} · ${rep.render_s} s</p><img style="max-width:100%" src="${u["contact-sheet.png"]}${t}">`;
+    status("Exported.");
+  } catch (e) { status("Failed: " + e.message); }
+};
+draw();
+</script>
