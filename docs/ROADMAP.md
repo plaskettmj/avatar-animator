@@ -24,7 +24,8 @@
 * **Motion is rigid:** float, tilt and breathe, plus blink. There is no mesh warping or gaze movement yet.
 
 ## Roadmap
-1. Live preview in the browser: send the layers once (subject PNG, filled background, eye data) and animate them
+1. Live preview in the browser (in progress). Step 1 is done: the slow prepare step (mask, crop, fill, eyes) is
+   split from export and cached per output folder / web job (`--prepare-only`, `/prepare`, `/export`). Next: send the layers once (subject PNG, filled background, eye data) and animate them
    client-side with Canvas/WebGL using the same periodic motion functions. Sliders then update instantly, and
    encoding happens only on export.
 2. Manual corrections: drag the crop square, paint the mask, click to place eyes, draw the swirl ellipse.

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Renders the four sample images and checks each result (size budget, seamless loop).
+# Unit tests for the prepare/export split, then renders the four sample images and checks each result
+# (size budget, seamless loop).
 # Runs sequentially: each render peaks at about 2-3 GB RAM. First run also downloads the models (~400 MB).
 set -euo pipefail
 cd "$(dirname "$0")"
 PY=.venv/bin/python
 [ -x "$PY" ] || { echo "Run ./install.sh first." >&2; exit 1; }
+$PY -m unittest discover -s tests 2>&1 | grep -E "^(Ran|OK|FAILED|FAIL:|ERROR:)|Error" ; [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "unit tests failed (run: $PY -m unittest discover -s tests -v)" >&2; exit 1; }
 $PY animate.py test-images/portrait-woman.jpg --style portrait -o out/portrait > /dev/null
 $PY animate.py test-images/pet-cat.jpg        --style pet      -o out/pet      > /dev/null
 $PY animate.py test-images/logo-badge.png     --style logo     -o out/logo     > /dev/null
