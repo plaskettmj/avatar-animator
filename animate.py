@@ -214,6 +214,55 @@ def _eyes_json(an, boxes):
                  grabbed=bool(e.get("grab", {}).get("found", False)))
             for e, b, sp in zip(an.eyes, boxes, an.eye_specs())]
 
+# ----------------------------------------------------------------- live preview layers (editor step 3)
+LIVE_SUBJECT = ("float", "breathe", "tilt", "blink")   # subject motions the browser preview animates itself
+LIVE_BG = ("parallax",)                                 # background motions it animates itself
+LIVE_PARAMS = ("float_amp", "breathe_amp", "tilt_deg", "blink_at", "blink_len", "parallax_amp")
+BLINK_LEVELS = 8   # the preview closes the eyes in this many steps (the export renders every frame exactly)
+
+def live_layers(an, d, url=""):
+    """Write the layers the browser preview (preview.js) animates, into directory d, and return its config.
+
+    background.png  the background frozen at t=0 with every motion except parallax (the preview drifts it itself)
+    subject.png     the subject colour + alpha on the padded canvas (the preview tilts / breathes / floats it)
+    blink.png       eye patches closing in BLINK_LEVELS steps, side by side (level k = blink amount k/BLINK_LEVELS),
+                    cropped to the box around all eyes; pasted over subject.png before the subject transform
+    Motions not listed in LIVE_SUBJECT / LIVE_BG (swirl, hue, twinkle, particles, sparkles, sweep) are not animated
+    in the preview: they show as they look at t=0 and are reported under "frozen"."""
+    os.makedirs(d, exist_ok=True)
+    u8 = lambda a: (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8)
+    Image.fromarray(u8(an.background(0.0, skip=("parallax",)))).save(os.path.join(d, "background.png"))
+    Image.fromarray(np.dstack([u8(an.fg), u8(an.alpha)]), "RGBA").save(os.path.join(d, "subject.png"))
+    blink = None
+    if an.eyes and "blink" in an.subj:
+        levels = [an.apply_blink(an.fg, k / BLINK_LEVELS) for k in range(1, BLINK_LEVELS + 1)]
+        base = u8(an.fg)
+        changed = np.zeros(an.fg.shape[:2], bool)
+        for rgb in levels:
+            changed |= (u8(rgb) != base).any(2)
+        if changed.any():
+            ys, xs = np.nonzero(changed)
+            x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+            a = u8(an.alpha[y0:y1, x0:x1])
+            strip = np.concatenate([np.dstack([u8(rgb[y0:y1, x0:x1]), a]) for rgb in levels], 1)
+            Image.fromarray(strip, "RGBA").save(os.path.join(d, "blink.png"))
+            blink = dict(levels=BLINK_LEVELS, box=[x0, y0, x1, y1])
+    if blink is None and os.path.exists(os.path.join(d, "blink.png")):
+        os.remove(os.path.join(d, "blink.png"))
+    present = list(an.subj) + list(an.bgm)
+    cfg = dict(
+        canvas=an.E, off=an.off, out=an.out, pivot=[float(an.pivot[0]), float(an.pivot[1])],
+        anchored=bool(an.anchored), has_subject=an.sbox is not None, style=an.style,
+        subject_motions=list(an.subj), bg_motions=list(an.bgm),
+        live=[m for m in present if m in LIVE_SUBJECT + LIVE_BG],
+        frozen=[m for m in present if m not in LIVE_SUBJECT + LIVE_BG and m != "backdrop"],
+        params={k: float(an.P[k]) for k in LIVE_PARAMS}, seconds=an.seconds, fps=an.fps,
+        eyes=len(an.eyes), blink=blink,
+        files={k: url + k + ".png" for k in ("background", "subject") + (("blink",) if blink else ())})
+    with open(os.path.join(d, "live.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    return cfg
+
 def export(path, outdir, style="portrait", subject=None, bg=None, seconds=3.0, fps=20, size=512,
            model="birefnet-general-lite", center=None, zoom=1.0, eyes=None, blink="auto", params=None,
            cache=True, log=print, eye_kind="auto"):
@@ -254,6 +303,7 @@ def export(path, outdir, style="portrait", subject=None, bg=None, seconds=3.0, f
                   model=model, eyes=[e["kind"] for e in an.eyes], eye_source=an.eye_source(), eyes_arg=eyes_arg(boxes),
                   eyes_src_arg=format_eye_specs(an.eye_specs()), eye_details=_eyes_json(an, boxes),
                   anchored=bool(an.anchored), frames=N, fps=fps,
+                  params={k: v for k, v in an.P.items() if DEFAULTS.get(k) != v},
                   seconds=seconds, gif=export_mod.check_file(base + ".gif"), webp=export_mod.check_file(base + ".webp"),
                   periodic_t1_equals_t0=bool(end is not None and np.array_equal(end, frames[0])),
                   cache=dict(hits=ana.hits, misses=ana.misses),

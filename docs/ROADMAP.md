@@ -28,6 +28,9 @@
   Subjects that touch the image edge get their edge pixels replicated, and long replications can look streaky.
 * **Segmentation edges:** there's no colour decontamination, so a faint fringe of the old background can move with
   the subject on high-contrast edges.
+* **Live preview:** particles, sparkles, twinkle, swirl, hue and sweep are shown still in the editor's preview
+  (Export animates them); blink closes in 8 steps rather than per frame; edge pixels can differ by a few levels
+  from the export (browser vs OpenCV resampling).
 * **Motion is rigid:** float, tilt and breathe, plus blink. There is no mesh warping or gaze movement yet.
 
 ## Roadmap
@@ -37,9 +40,10 @@
    * Step 2 (done): eye editor. Chat path (`prep/grid.png` + `--eyes-at`) and browser editor (`/editor`: click
      to add, drag, resize, per-eye cartoon/photo blink, test blink, cut-out view and model switch). Eyes are
      stored in source-image pixels; clicked points grab the eye shape.
-   * Step 3 (next): animate the layers client-side with Canvas using the same periodic motion functions, so
-     sliders update instantly and encoding happens only on export. The editor's "Test blink" currently asks the
-     server for a short strip of real frames.
+   * Step 3 (done): live preview. `preview.js` animates float, breathe, tilt, blink and parallax on a Canvas
+     from the `/preview` layers with the renderer's own motion math (checked against it under node), so the
+     sliders update instantly and encoding happens only on Export. Swirl, hue, twinkle, particles, sparkles and
+     sweep are shown still (as at t=0) and labelled. Blink is previewed in 8 steps.
    * Step 4: crop drag and zoom, clamped to the image so the border is never smeared.
    * Step 5: template skill wiring, docs, golden tests.
 2. Manual corrections: drag the crop square (step 4), paint the mask, draw the swirl ellipse.

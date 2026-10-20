@@ -891,11 +891,14 @@ class Animator:
         sub = sp[Y0 - y0:Y1 - y0, X0 - x0:X1 - x0, None]
         f[Y0:Y1, X0:X1] = 1 - (1 - f[Y0:Y1, X0:X1]) * (1 - np.clip(sub * color, 0, 1))  # screen blend
 
-    def background(self, t):
+    def background(self, t, skip=()):
+        """Background layer at time t. skip: motions to leave out (the live preview freezes the background
+        without parallax and applies parallax itself)."""
         P, E, out = self.P, self.E, self.out
         f = self.bg.copy()
         tau = 2 * np.pi * t
-        if "swirl" in self.bgm:
+        bgm = [m for m in self.bgm if m not in skip]
+        if "swirl" in bgm:
             NT = self.sw_NT
             pa, pb = t % 1, (t + 0.5) % 1
             wa, wb = tri(pa), tri(pb)
@@ -905,22 +908,19 @@ class Animator:
                            cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
             nrm = 1 / math.sqrt(wa * wa + wb * wb)
             f = self.bg * (1 - self.sw_w) + (self.sw_Lc + (wa * da + wb * db) * nrm) * self.sw_w
-        if "hue" in self.bgm:
+        if "hue" in bgm:
             hsv = cv2.cvtColor(np.clip(f, 0, 1).astype(np.float32), cv2.COLOR_RGB2HSV)
             hsv[..., 0] = (hsv[..., 0] + P["hue_deg"] * math.sin(tau)) % 360
             f = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-        if "twinkle" in self.bgm:
+        if "twinkle" in bgm:
             for (x, y, s, k, ph) in self.twinkles:
                 v = max(0.0, math.sin(2 * np.pi * (k * t + ph))) ** 3
                 if v > 0.02:
                     self._add_sprite(f, x, y, 0.35 * s * out / 512, v, np.array([0.9, 0.95, 1.0], np.float32))
-        if "parallax" in self.bgm:
-            A = P["parallax_amp"] * out
-            M = np.float32([[1, 0, A * math.cos(tau)], [0, 1, 0.6 * A * math.sin(tau)]])
-            # zoom a touch so shifted edges never show
-            M = cv2.getRotationMatrix2D((E / 2, E / 2), 0, 1.0 + 2 * P["parallax_amp"]) ; M[0, 2] += A * math.cos(tau); M[1, 2] += 0.6 * A * math.sin(tau)
+        if "parallax" in bgm:
+            M = self.parallax_matrix(t)
             f = cv2.warpAffine(f.astype(np.float32), M, (E, E), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-        if "particles" in self.bgm:
+        if "particles" in bgm:
             ov = np.zeros((E, E), np.float32)
             for (x0, y0, r, k, ph, a) in self.particles:
                 y = (y0 - k * t * E) % E
@@ -929,26 +929,19 @@ class Animator:
             ov = cv2.GaussianBlur(ov, (0, 0), 1.2 * out / 512)[..., None]
             ov = np.clip(ov, 0, 1) * 0.9
             f = f * (1 - ov) + self.pcol * ov
-        if "sparkles" in self.bgm:
+        if "sparkles" in bgm:
             for (x, y, s, k, ph) in self.sparkles:
                 v = max(0.0, math.sin(2 * np.pi * (k * t + ph))) ** 2
                 if v > 0.02:
                     self._add_sprite(f, x, y, (0.6 + 0.6 * v) * s * out / 512, v, self.tint)
         return f
 
-    def blink_amount(self, t):
-        u = (t - self.P["blink_at"]) / self.P["blink_len"]
-        return float(np.sin(np.pi * u) ** 0.6) if 0 < u < 1 else 0.0
-
-    def subject(self, t):
-        """Return (rgb, alpha) of the subject layer at time t, already transformed."""
+    # Motion math. preview.js mirrors motion(), subject_matrix(), parallax_matrix() and blink_amount()
+    # line for line (tests/test_live.py checks they agree), so keep the two in step when changing either.
+    def motion(self, t):
+        """Subject pose at loop time t in [0, 1]: (angle_deg, scale, tx, ty) about self.pivot."""
         P, out = self.P, self.out
         tau = 2 * np.pi * t
-        rgb, a = self.fg, self.alpha
-        if self.eyes and "blink" in self.subj:
-            b = self.blink_amount(t)
-            if b > 0:
-                rgb = self.apply_blink(rgb, b)
         ang, sc, tx, ty = 0.0, 1.0, 0.0, 0.0
         if "float" in self.subj:
             ty = -P["float_amp"] * out * (1 - math.cos(tau)) / 2   # rises from the rest pose and settles back (never sinks, so the area above the subject is never uncovered)
@@ -956,9 +949,39 @@ class Animator:
             sc = 1 + P["breathe_amp"] * (0.5 - 0.5 * math.cos(2 * tau)) if self.style == "logo" else 1 + P["breathe_amp"] * math.sin(tau) * 0.6
         if "tilt" in self.subj:
             ang = P["tilt_deg"] * math.sin(tau + 0.6)
-        if (ang, sc, tx, ty) != (0.0, 1.0, 0.0, 0.0):
-            px, py = self.pivot
-            M = affine_about(px, py, ang, sc, tx, ty)
+        return ang, sc, tx, ty
+
+    def subject_matrix(self, t):
+        """2x3 affine (cv2 convention, canvas px) applied to the subject layer at time t, or None at rest."""
+        ang, sc, tx, ty = self.motion(t)
+        if (ang, sc, tx, ty) == (0.0, 1.0, 0.0, 0.0):
+            return None
+        px, py = self.pivot
+        return affine_about(px, py, ang, sc, tx, ty)
+
+    def parallax_matrix(self, t):
+        """2x3 affine for the parallax background drift at time t (zoomed a touch so shifted edges never show)."""
+        P, E = self.P, self.E
+        A = P["parallax_amp"] * self.out
+        tau = 2 * np.pi * t
+        M = cv2.getRotationMatrix2D((E / 2, E / 2), 0, 1.0 + 2 * P["parallax_amp"])
+        M[0, 2] += A * math.cos(tau); M[1, 2] += 0.6 * A * math.sin(tau)
+        return M
+
+    def blink_amount(self, t):
+        u = (t - self.P["blink_at"]) / self.P["blink_len"]
+        return float(np.sin(np.pi * u) ** 0.6) if 0 < u < 1 else 0.0
+
+    def subject(self, t):
+        """Return (rgb, alpha) of the subject layer at time t, already transformed."""
+        P = self.P
+        rgb, a = self.fg, self.alpha
+        if self.eyes and "blink" in self.subj:
+            b = self.blink_amount(t)
+            if b > 0:
+                rgb = self.apply_blink(rgb, b)
+        M = self.subject_matrix(t)
+        if M is not None:
             rgb = cv2.warpAffine(rgb.astype(np.float32), M, (self.E, self.E), flags=cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_REFLECT_101 if self.anchored else cv2.BORDER_CONSTANT)
             a = cv2.warpAffine(a, M, (self.E, self.E), flags=cv2.INTER_LINEAR,

@@ -17,6 +17,12 @@ JSON endpoints (used by the eye editor; bots can call them too):
                  "style", "subject", "bg", "model", "eye_kind", "seconds", "fps", "blink", "params"}
                  -> {"job", "report", "urls"}. Reuses the job's cached analysis, so it skips segmentation.
                  Omitted settings fall back to the ones used in /prepare.
+  POST /preview  JSON {"job", "eyes" (as /eyes), "no_blink", "subject", "bg", "style"?} -> {"eyes", "live", "urls"}:
+                 the layers the editor's live preview animates in the browser (preview.js): background frozen at t=0
+                 without parallax, the subject layer, and the eye patches closing in steps. Sliders (float, breathe,
+                 tilt, blink timing, parallax, loop length) then update instantly with no server call; only eye
+                 edits and motion toggles that change the frozen background call this again. live.frozen lists the
+                 motions the preview shows still (swirl, hue, twinkle, particles, sparkles, sweep): Export renders them.
 """
 import html, io, json, os, re, sys, threading, time, uuid
 import numpy as np
@@ -26,7 +32,7 @@ from email.policy import default as email_default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from animate import run, prepare, export, parse_eyes, collect_eyes, MODELS
+from animate import run, prepare, export, parse_eyes, collect_eyes, live_layers, MODELS
 from avatar_animator.core import STYLES, SUBJECT_MOTIONS, BG_MOTIONS, EYE_KINDS, Analysis, Animator
 import cv2
 
@@ -68,6 +74,9 @@ class H(BaseHTTPRequestHandler):
         if path == "/editor":
             with open(os.path.join(HERE, "editor.html"), "rb") as f:
                 return self._send(200, f.read())
+        if path == "/preview.js":
+            with open(os.path.join(HERE, "preview.js"), "rb") as f:
+                return self._send(200, f.read(), "text/javascript; charset=utf-8")
         if path.startswith("/jobs/"):
             p = os.path.normpath(os.path.join(ROOT, path[len("/jobs/"):]))
             if p.startswith(ROOT) and os.path.isfile(p):
@@ -184,27 +193,26 @@ class H(BaseHTTPRequestHandler):
                     specs.append(tuple(map(float, e[:4])) + ((str(e[4]),) if len(e) > 4 else ()))
         return collect_eyes(specs or None, req.get("eyes_src"), req.get("eyes_at"))
 
-    def _eyes(self):
-        """Resolve eyes (grab shapes, pick blink styles) and optionally render a blink test strip."""
-        try:
-            req = self._body_json()
-        except ValueError:
-            return self._json(400, dict(error="body must be JSON"))
-        job, d = self._job_dir(req.get("job"))
-        if not job:
-            return self._json(404, dict(error="unknown job"))
+    def _animator(self, d, req, force_blink=True):
+        """Animator for a job from its saved settings plus the request's eyes / motion overrides (cached analysis)."""
         st = self._clean(self._settings(d))
-        try:
-            eyes = self._eye_list(req)
-            src = np.asarray(Image.open(os.path.join(d, "input")).convert("RGB"))
-            ana = Analysis(src, cache_dir=os.path.join(d, "prep"), log=lambda *a, **k: None)
-            subj = list(st.get("subject") or STYLES[st.get("style", "portrait")]["subject"])
-            if "blink" not in subj: subj.append("blink")
-            an = Animator(src, style=st.get("style", "portrait"), subject=subj, bg=st.get("bg"),
-                          model=st.get("model", "birefnet-general-lite"), eyes=eyes,
-                          eye_kind=st.get("eye_kind", "auto"), analysis=ana, log=lambda *a, **k: None)
-        except (Exception, SystemExit) as e:
-            return self._json(500, dict(error=str(e)))
+        eyes = self._eye_list(req)
+        src = np.asarray(Image.open(os.path.join(d, "input")).convert("RGB"))
+        ana = Analysis(src, cache_dir=os.path.join(d, "prep"), log=lambda *a, **k: None)
+        style = req.get("style") if req.get("style") in STYLES else st.get("style", "portrait")
+        subj = req.get("subject") if isinstance(req.get("subject"), list) else st.get("subject")
+        subj = [m for m in (subj if subj is not None else STYLES[style]["subject"]) if m in SUBJECT_MOTIONS]
+        bg = req.get("bg") if isinstance(req.get("bg"), list) else st.get("bg")
+        if bg is not None: bg = [m for m in bg if m in BG_MOTIONS]
+        if req.get("no_blink"):
+            subj, eyes = [m for m in subj if m != "blink"], None
+        elif force_blink and "blink" not in subj:
+            subj.append("blink")
+        return Animator(src, style=style, subject=subj, bg=bg, model=st.get("model", "birefnet-general-lite"),
+                        eyes=eyes, eye_kind=st.get("eye_kind", "auto"), analysis=ana, log=lambda *a, **k: None)
+
+    @staticmethod
+    def _eye_json(an):
         res = []
         for e, sp in zip(an.eyes, an.eye_specs()):
             r = {k: (round(float(v), 1) if k != "kind" else v) for k, v in sp.items()}
@@ -214,12 +222,48 @@ class H(BaseHTTPRequestHandler):
                 c = cv2.approxPolyDP(max(cs, key=cv2.contourArea), 1.0, True)[:, 0, :].astype(float)
                 r["outline"] = [[round(v, 1) for v in an.canvas_to_src(x, y)] for x, y in c]
             res.append(r)
+        return res
+
+    def _eyes(self):
+        """Resolve eyes (grab shapes, pick blink styles) and optionally render a blink test strip."""
+        try:
+            req = self._body_json()
+        except ValueError:
+            return self._json(400, dict(error="body must be JSON"))
+        job, d = self._job_dir(req.get("job"))
+        if not job:
+            return self._json(404, dict(error="unknown job"))
+        try:
+            an = self._animator(d, {"eyes": req.get("eyes"), "eyes_src": req.get("eyes_src"), "eyes_at": req.get("eyes_at")})
+        except (Exception, SystemExit) as e:
+            return self._json(500, dict(error=str(e)))
+        res = self._eye_json(an)
         urls = {}
         if req.get("test_blink"):
             strip = np.concatenate([an.still(b) for b in BLINK_STEPS], 1)
             Image.fromarray(strip).save(os.path.join(d, "blink-test.png"))
             urls["blink"] = f"/jobs/{job}/blink-test.png?t={time.time():.3f}"
         self._json(200, dict(job=job, eyes=res, frames=len(BLINK_STEPS), size=an.out, urls=urls))
+
+    def _preview(self):
+        """Write the live-preview layers for the current eyes and motions (see POST /preview above)."""
+        try:
+            req = self._body_json()
+        except ValueError:
+            return self._json(400, dict(error="body must be JSON"))
+        job, d = self._job_dir(req.get("job"))
+        if not job:
+            return self._json(404, dict(error="unknown job"))
+        t0 = time.time()
+        try:
+            an = self._animator(d, req, force_blink=False)
+            stamp = f"?t={time.time():.3f}"
+            live = live_layers(an, os.path.join(d, "live"))
+        except (Exception, SystemExit) as e:
+            return self._json(500, dict(error=str(e)))
+        urls = {k: f"/jobs/{job}/live/{os.path.basename(v)}{stamp}" for k, v in live["files"].items()}
+        live["prep_s"] = round(time.time() - t0, 2)
+        self._json(200, dict(job=job, eyes=self._eye_json(an), live=live, urls=urls))
 
     def _export(self):
         try:
@@ -256,6 +300,8 @@ class H(BaseHTTPRequestHandler):
             return self._export()
         if self.path == "/eyes":
             return self._eyes()
+        if self.path == "/preview":
+            return self._preview()
         fields, img = self._form()
         if not img:
             return self._send(400, page("<p>No image uploaded.</p>"))

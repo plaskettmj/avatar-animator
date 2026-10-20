@@ -163,9 +163,19 @@ automatically), drag to move, drag the square handle to resize, Delete to remove
 eye. "Show cut-out" shows the mask; switching the cut-out model or style keeps your eyes. "Test blink" plays
 the real renderer closing the eyes in about a second; "Export" renders and encodes the loop.
 
+**Live preview:** after Prepare, the "3. Live preview" panel under the editor plays the avatar in the browser,
+with round 96/48/32 px copies at sidebar sizes. Sliders for float height, breathe, tilt, blink timing and
+length, background drift (parallax) and loop length update it instantly; nothing is rendered on the server
+while you drag. Ticking float, breathe, tilt or parallax on or off is also instant. The preview shows the frames
+the export will sample (same fps and loop length), and Export uses the slider values and toggles. Particles,
+sparkles, twinkle, swirl, hue and sweep need the full renderer, so the preview shows them as they look at t=0
+and labels them; Export animates them. Eye edits refresh the preview layers in about half a second.
+
 JSON endpoints for editors and bots (details in the docstring at the top of `webui.py`): `POST /prepare`
 (multipart upload, or JSON `{"job", "model", "style"}` to re-prepare a job), `POST /eyes` (resolve clicked
-points into eyes, optional blink test strip) and `POST /export` (eyes in source pixels or any CLI format).
+points into eyes, optional blink test strip), `POST /preview` (the layers the live preview animates: frozen
+background, subject, eye patches closing in steps) and `POST /export` (eyes in source pixels or any CLI format,
+plus `params`, `subject`, `bg`, `seconds` from the sliders).
 
 ## How it works
 
@@ -185,7 +195,8 @@ image ─► subject mask (BiRefNet-lite via rembg) ─► square crop on the su
 ```
 
 This runs the unit tests in `tests/` (prepare/export split, cache reuse, eye round-trip, eye grabbing and blink
-styles, grid cells, CLI and web endpoints),
+styles, grid cells, live-preview layers and the browser motion math checked against the renderer under node,
+CLI and web endpoints),
 then renders the four CC0 sample images in `test-images/` and checks the size budget and the seamless loop
 for each one.
 

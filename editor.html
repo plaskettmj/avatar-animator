@@ -10,7 +10,13 @@ a{color:#8cf} button,select,input{font:inherit} button{padding:.3em .8em;margin:
 .eye.sel{border-color:#0ef} .muted{color:#999;font-size:.9em} #status{min-height:1.4em;color:#fd6}
 .av{width:96px;height:96px;border-radius:50%;object-fit:cover;margin-right:8px;vertical-align:middle}
 fieldset{border:1px solid #444;margin:.5em 0}
+#live{display:none} #pvwrap{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+#pv{width:384px;height:384px;max-width:100%;border-radius:10px;background:#222}
+.mirror{border-radius:50%;vertical-align:middle;margin-right:8px;background:#222}
+#sliders{flex:1;min-width:300px} #sliders label.sl{display:grid;grid-template-columns:9em 1fr 4em;gap:.5em;align-items:center;margin:.25em 0}
+#sliders input[type=range]{width:100%} .frozen{color:#fd6}
 </style>
+<script src=/preview.js></script>
 <h1>Eye editor</h1>
 <fieldset><legend>1. Image</legend>
 <input type=file id=file accept=image/*>
@@ -32,11 +38,43 @@ Cut-out <select id=model><option value=birefnet-general-lite>fast (lite)</option
   <div id=result></div>
  </div>
 </div>
+<fieldset id=live><legend>3. Live preview</legend>
+<div id=pvwrap>
+ <div>
+  <canvas id=pv width=512 height=512></canvas><br>
+  <canvas class=mirror id=m96 width=96 height=96></canvas><canvas class=mirror id=m48 width=48 height=48></canvas><canvas class=mirror id=m32 width=32 height=32></canvas>
+  <span class=muted>sidebar sizes</span>
+ </div>
+ <div id=sliders>
+  <p><button id=play>Pause</button> <input type=range id=scrub min=0 max=1 step=0.001 value=0 style="width:12em" title="loop time (pauses)"> <span id=tlabel class=muted></span></p>
+  <div id=motions></div>
+  <div id=sl></div>
+  <p><button id=resetsl>Reset sliders</button> <span class=muted id=pvinfo></span></p>
+  <p class=muted id=frozen></p>
+  <p class=muted>Sliders update the preview instantly in your browser: no rendering on the server. The preview shows the
+  frames the export will sample (same fps and loop length). Export uses these settings.</p>
+ </div>
+</div>
+</fieldset>
 <script>
 const $ = id => document.getElementById(id);
 const cv = $("cv"), ctx = cv.getContext("2d");
 let job = null, prep = null, eyes = [], sel = -1, imgCrop = new Image(), imgMask = new Image(), drag = null, playing = false;
 const KINDS = ["auto", "cartoon", "photo"];
+const pv = new AvatarPreview.LivePreview($("pv"), [$("m96"), $("m48"), $("m32")]);
+window.livePreview = pv;   // for scripted checks
+let live = null, motionState = null, pvBusy = false, pvPending = false;
+const SUBJ_TOGGLES = ["float", "breathe", "tilt", "sweep"];
+const BG_TOGGLES = ["parallax", "particles", "sparkles", "twinkle", "swirl", "hue", "backdrop"];
+const SLIDERS = [  // key, label, min, max, step, format
+  ["float_amp", "Float height", 0, 0.08, 0.005, v => (v * 100).toFixed(1) + "%"],
+  ["breathe_amp", "Breathe", 0, 0.08, 0.005, v => (v * 100).toFixed(1) + "%"],
+  ["tilt_deg", "Tilt", 0, 12, 0.5, v => v.toFixed(1) + "°"],
+  ["blink_at", "Blink at", 0, 0.96, 0.01, v => Math.round(v * 100) + "%"],
+  ["blink_len", "Blink length", 0.04, 0.3, 0.01, v => (v * pv.seconds).toFixed(2) + " s"],
+  ["parallax_amp", "Background drift", 0, 0.06, 0.005, v => (v * 100).toFixed(1) + "%"],
+  ["seconds", "Loop length", 1.5, 6, 0.5, v => v.toFixed(1) + " s"],
+];
 const COL = {cartoon: "#00e6ff", photo: "#ffe600", auto: "#ccc"};
 function status(t) { $("status").textContent = t || ""; }
 async function post(url, body, isForm) {
@@ -78,7 +116,7 @@ function renderList() {
     d.innerHTML = `<b>Eye ${i + 1}</b> blink <select>${KINDS.map(x => `<option ${x === (e.want || e.kind) ? "selected" : ""}>${x}</option>`).join("")}</select>
       <button>delete</button> <span class=muted>${Math.round(e.x)},${Math.round(e.y)} ${Math.round(e.w)}×${Math.round(e.h)} px${e.grabbed ? " · shape found" : ""}</span>`;
     d.querySelector("select").onchange = ev => { e.want = ev.target.value; sel = i; resolve(); };
-    d.querySelector("button").onclick = () => { eyes.splice(i, 1); sel = -1; draw(); };
+    d.querySelector("button").onclick = () => { eyes.splice(i, 1); sel = -1; draw(); resolve().catch(e => status("Failed: " + e.message)); };
     d.onclick = () => { sel = i; draw(); };
     $("eyes").appendChild(d);
   });
@@ -88,19 +126,102 @@ async function resolve(test) {
   const selObj = eyes[sel];
   eyes.sort((a, b) => a.x - b.x);   // the server numbers eyes left to right
   sel = selObj ? eyes.indexOf(selObj) : -1;
-  const body = {job, eyes: eyes.map(e => ({x: e.x, y: e.y, w: e.w || null, h: e.h || null, kind: e.want || "auto"})), test_blink: !!test};
-  const r = await post("/eyes", body);
+  const eyeBody = eyes.map(e => ({x: e.x, y: e.y, w: e.w || null, h: e.h || null, kind: e.want || "auto"}));
+  const r = test ? await post("/eyes", {job, eyes: eyeBody, test_blink: true}) : await refreshPreview(eyeBody);
+  if (!r || r.eyesKept) return r;
   eyes = r.eyes.map((e, i) => Object.assign(e, {want: (eyes[i] && eyes[i].want) || "auto"}));
   // the server sorts eyes left to right; keep the selection on the same eye where possible
   draw();
   return r;
 }
+// ---------------------------------------------------------------- live preview (step 3)
+function eyeBodyNow() { return eyes.map(e => ({x: e.x, y: e.y, w: e.w || null, h: e.h || null, kind: e.want || "auto"})); }
+// ask the server for the preview layers (only for eye edits and toggles that change the frozen background);
+// one request at a time, the latest state wins
+async function refreshPreview(eyeBody) {
+  if (!job) return null;
+  if (pvBusy) { pvPending = true; return null; }
+  pvBusy = true;
+  try {
+    const eb = eyeBody || eyeBodyNow();
+    // no eyes in the editor (or "No blink") means no blink: the server would otherwise auto-detect eyes again
+    const body = {job, eyes: eb, no_blink: $("noblink").checked || !eb.length};
+    if (motionState) { body.subject = motionState.subject.concat(["blink"]); body.bg = motionState.bg; }
+    const r = await post("/preview", body);
+    const first = !live;
+    live = r.live;
+    if (!motionState) motionState = {subject: live.subject_motions.filter(m => m !== "blink"), bg: live.bg_motions.slice()};
+    await pv.load(live, r.urls, !first);
+    // the browser keeps its own toggles for the motions it animates
+    pv.motions = AvatarPreview.LIVE.filter(m => m === "blink" ? !$("noblink").checked && live.blink : motionState.subject.includes(m) || motionState.bg.includes(m));
+    pv.dirty = true;
+    if (first) { buildSliders(); $("live").style.display = "block"; pv.play(); }
+    renderMotions(); pvInfo();
+    r.eyesKept = body.no_blink;   // eyes were not resolved: keep the editor's list as it is
+    return r;
+  } finally {
+    pvBusy = false;
+    if (pvPending) { pvPending = false; setTimeout(() => refreshPreview().then(r => { if (r && !r.eyesKept) { eyes = r.eyes.map((e, i) => Object.assign(e, {want: (eyes[i] && eyes[i].want) || "auto"})); draw(); } }).catch(e => status("Failed: " + e.message)), 0); }
+  }
+}
+function pvInfo() {
+  $("pvinfo").textContent = live ? `layers ${live.prep_s} s · ${live.eyes} eye(s)${live.blink ? "" : " · no blink layer"}` : "";
+  const fr = live.frozen.filter(m => motionState.subject.includes(m) || motionState.bg.includes(m));
+  $("frozen").innerHTML = fr.length ? `<span class=frozen>Shown still in this preview: ${fr.join(", ")}</span> (they need the full renderer; Export animates them).` : "";
+}
+function renderMotions() {
+  const box = $("motions"); box.innerHTML = "";
+  const add = (m, list) => {
+    const on = motionState[list].includes(m), isLive = AvatarPreview.LIVE.includes(m);
+    const l = document.createElement("label");
+    l.innerHTML = `<input type=checkbox ${on ? "checked" : ""}> ${m}${isLive || m === "backdrop" ? "" : "*"} `;
+    l.querySelector("input").onchange = ev => {
+      motionState[list] = motionState[list].filter(x => x !== m); if (ev.target.checked) motionState[list].push(m);
+      if (isLive) { pv.setMotion(m, ev.target.checked); pvInfo(); }
+      else if (list === "bg") { status("Updating background layer..."); refreshPreview().then(() => status("")).catch(e => status("Failed: " + e.message)); }
+      else pvInfo();
+    };
+    box.appendChild(l);
+  };
+  box.append("Subject: "); SUBJ_TOGGLES.forEach(m => add(m, "subject"));
+  box.appendChild(document.createElement("br"));
+  box.append("Background: "); BG_TOGGLES.forEach(m => add(m, "bg"));
+  const n = document.createElement("div"); n.className = "muted"; n.textContent = "* shown still in the preview, animated in the export"; box.appendChild(n);
+}
+function sliderValue(k) { return k === "seconds" ? pv.seconds : pv.P[k]; }
+function buildSliders() {
+  const box = $("sl"); box.innerHTML = "";
+  for (const [k, label, lo, hi, step, fmt] of SLIDERS) {
+    const l = document.createElement("label"); l.className = "sl";
+    l.innerHTML = `<span>${label}</span><input type=range id=sl_${k} min=${lo} max=${hi} step=${step}><span class=muted id=v_${k}></span>`;
+    box.appendChild(l);
+    const inp = l.querySelector("input"); inp.value = sliderValue(k);
+    const show = () => { $("v_" + k).textContent = fmt(+inp.value); };
+    inp.oninput = () => {
+      let v = +inp.value;
+      if (k === "seconds") pv.setSeconds(v);
+      else {
+        if (k === "blink_at") v = Math.min(v, 1 - pv.P.blink_len);   // keep the blink inside the loop
+        if (k === "blink_len") pv.set("blink_at", Math.min(pv.P.blink_at, 1 - v));
+        pv.set(k, v);
+      }
+      show(); if (k === "blink_len" || k === "seconds") { $("sl_blink_at").value = pv.P.blink_at; $("v_blink_len").textContent = SLIDERS[4][5](pv.P.blink_len); }
+    };
+    show();
+  }
+}
+$("resetsl").onclick = () => { if (!live) return; Object.assign(pv.P, live.params); pv.setSeconds(live.seconds); buildSliders(); pv.dirty = true; };
+$("play").onclick = () => { if (pv.playing) { pv.pause(); $("play").textContent = "Play"; } else { pv.play(); $("play").textContent = "Pause"; } };
+$("scrub").oninput = () => { if (pv.playing) { pv.pause(); $("play").textContent = "Play"; } pv.render(pv.quantize(+$("scrub").value)); };
+pv.onframe = t => { $("tlabel").textContent = `t=${(t * pv.seconds).toFixed(2)} s`; if (pv.playing) $("scrub").value = t; };
 async function setPrep(r, keepEyes) {
   job = r.job; prep = r.prep;
   await Promise.all([load(imgCrop, r.urls["prep/crop.png"]), load(imgMask, r.urls["prep/mask.png"])]);
   if (!keepEyes) eyes = prep.eyes.map(e => Object.assign({}, e.src, {kind: e.kind, want: "auto", grabbed: e.grabbed}));
   sel = -1; draw();
-  if (keepEyes && eyes.length) await resolve();
+  motionState = null;   // a new image or style starts from the style's motions
+  if (live) { live = null; pv.P = {}; }
+  await resolve();
   status(`Prepared in ${prep.prep_s} s · eyes from: ${prep.eye_source} · cut-out: ${prep.model}`);
 }
 $("prep").onclick = async () => {
@@ -117,7 +238,8 @@ $("prep").onclick = async () => {
 };
 $("model").onchange = $("style").onchange = () => { if (job) $("prep").onclick(); };
 $("showmask").onchange = draw;
-$("reset").onclick = () => { if (!prep) return; eyes = prep.eyes.map(e => Object.assign({}, e.src, {kind: e.kind, want: "auto", grabbed: e.grabbed})); sel = -1; draw(); };
+$("noblink").onchange = () => { pv.setMotion("blink", !$("noblink").checked && !!(live && live.blink)); if (!$("noblink").checked && live && !live.blink && eyes.length) resolve().catch(e => status("Failed: " + e.message)); };
+$("reset").onclick = () => { if (!prep) return; eyes = prep.eyes.map(e => Object.assign({}, e.src, {kind: e.kind, want: "auto", grabbed: e.grabbed})); sel = -1; draw(); resolve().catch(e => status("Failed: " + e.message)); };
 
 function hit(x, y) {
   for (let i = eyes.length - 1; i >= 0; i--) {
@@ -153,7 +275,7 @@ cv.onpointerup = async () => {
 };
 document.onkeydown = ev => {
   if ((ev.key === "Delete" || ev.key === "Backspace") && sel >= 0 && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "SELECT") {
-    eyes.splice(sel, 1); sel = -1; draw(); ev.preventDefault();
+    eyes.splice(sel, 1); sel = -1; draw(); ev.preventDefault(); resolve().catch(e => status("Failed: " + e.message));
   }
 };
 $("test").onclick = async () => {
@@ -175,8 +297,13 @@ $("export").onclick = async () => {
   if (!job) return;
   status("Exporting (rendering + GIF/WebP encoding, about 40-60 s)...");
   try {
-    const r = await post("/export", {job, no_blink: $("noblink").checked,
-      eyes: $("noblink").checked ? [] : eyes.map(e => ({x: e.x, y: e.y, w: e.w, h: e.h, kind: e.kind}))});
+    const body = {job, no_blink: $("noblink").checked || !eyes.length,
+      eyes: $("noblink").checked ? [] : eyes.map(e => ({x: e.x, y: e.y, w: e.w, h: e.h, kind: e.kind}))};
+    if (live && motionState) {   // the live preview's sliders and motion toggles
+      body.params = Object.assign({}, pv.P); body.seconds = pv.seconds; body.fps = pv.fps;
+      body.subject = motionState.subject.concat(body.no_blink ? [] : ["blink"]); body.bg = motionState.bg;
+    }
+    const r = await post("/export", body);
     const t = "?t=" + Date.now(), rep = r.report, u = r.urls;
     $("result").innerHTML = `<p><img class=av src="${u["avatar.gif"]}${t}"><img class=av style="width:48px;height:48px" src="${u["avatar.webp"]}${t}">
       <img class=av style="width:32px;height:32px" src="${u["avatar.gif"]}${t}"></p>
