@@ -1,5 +1,5 @@
 """Avatar animator core: segmentation, layering, motion presets, rendering."""
-import math, os
+import hashlib, json, math, os
 import numpy as np, cv2
 from PIL import Image
 
@@ -201,6 +201,97 @@ def eyes_from_boxes(boxes, E):
         eyes.append(dict(kind="photo", poly=poly))
     return eyes
 
+# ----------------------------------------------------------------- slow analysis (cacheable)
+ANALYSIS_VERSION = 1
+
+class Analysis:
+    """The slow, settings-independent part of preparing an image: the subject mask (BiRefNet/rembg) and the
+    face and cat-eye detectors, all run on a working copy with long side <= 1024 px. Results are computed on
+    first use and, when cache_dir is given, saved there and reused by later runs on the same image bytes.
+    Everything that depends on style, crop, size or eyes is cheap and is recomputed by Animator each time."""
+
+    def __init__(self, src_rgb, cache_dir=None, key=None, log=print):
+        self.log = log
+        H0, W0 = src_rgb.shape[:2]
+        self.sc = min(1.0, 1024 / max(H0, W0))
+        self.work = (cv2.resize(src_rgb, (int(W0 * self.sc), int(H0 * self.sc)), interpolation=cv2.INTER_AREA)
+                     if self.sc < 1 else src_rgb)
+        self.key = key or hashlib.sha256(np.ascontiguousarray(src_rgb).tobytes()).hexdigest()
+        self.cache_dir = cache_dir
+        self.hits, self.misses = [], []   # which slow steps came from the cache / were computed (unique, in order)
+        self._meta = dict(version=ANALYSIS_VERSION, key=self.key, source_size=[W0, H0], scale=self.sc)
+        self._masks = {}
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            mp = os.path.join(cache_dir, "analysis.json")
+            old = None
+            if os.path.exists(mp):
+                try:
+                    with open(mp) as f:
+                        old = json.load(f)
+                except ValueError:
+                    old = None
+            if old and old.get("version") == ANALYSIS_VERSION and old.get("key") == self.key:
+                self._meta = old
+            else:   # different image (or old format): drop stale cache files
+                for f in os.listdir(cache_dir):
+                    if f == "analysis.json" or (f.startswith("mask-") and f.endswith(".png")):
+                        os.remove(os.path.join(cache_dir, f))
+                self._save()
+
+    @staticmethod
+    def _note(lst, what):
+        if what not in lst:
+            lst.append(what)
+
+    def _save(self):
+        if self.cache_dir:
+            tmp = os.path.join(self.cache_dir, "analysis.json.part")
+            with open(tmp, "w") as f:
+                json.dump(self._meta, f, indent=1)
+            os.replace(tmp, os.path.join(self.cache_dir, "analysis.json"))
+
+    def mask(self, model="birefnet-general-lite"):
+        """Soft subject mask at working resolution, float32 in [0,1]."""
+        if model in self._masks:
+            return self._masks[model]
+        path = os.path.join(self.cache_dir, f"mask-{model}.png") if self.cache_dir else None
+        if path and os.path.exists(path):
+            m = np.asarray(Image.open(path)).astype(np.float32) / 255.0   # lossless: rembg masks are 8-bit
+            self._note(self.hits, f"mask:{model}")
+        else:
+            m = segment(self.work, model)
+            self._note(self.misses, f"mask:{model}")
+            if path:
+                Image.fromarray(np.round(m * 255).astype(np.uint8)).save(path)
+        self._masks[model] = m
+        return m
+
+    def face(self):
+        """(eyes, face_box) from MediaPipe on the working copy, cached."""
+        if "face" in self._meta:
+            self._note(self.hits, "face")
+            f = self._meta["face"]
+            return ([dict(kind="photo", poly=np.array(p, np.float32)) for p in f["eyes"]],
+                    tuple(np.float32(v) for v in f["box"]) if f["box"] is not None else None)
+        eyes, box = detect_face_eyes(self.work)
+        self._note(self.misses, "face")
+        self._meta["face"] = dict(eyes=[e["poly"].tolist() for e in eyes],
+                                  box=[float(v) for v in box] if box is not None else None)
+        self._save()
+        return eyes, box
+
+    def pet(self):
+        """Cat-eye polygons on the working copy, cached."""
+        if "pet" in self._meta:
+            self._note(self.hits, "pet")
+            return [np.array(p, np.float32) for p in self._meta["pet"]]
+        polys = detect_pet_eyes(self.work)
+        self._note(self.misses, "pet")
+        self._meta["pet"] = [p.tolist() for p in polys]
+        self._save()
+        return polys
+
 # ----------------------------------------------------------------- helpers
 def soft(mask, r):
     return cv2.GaussianBlur(mask.astype(np.float32), (0, 0), max(r, 0.5))
@@ -231,7 +322,7 @@ def tri(p):
 class Animator:
     def __init__(self, src_rgb, out=512, style="portrait", subject=None, bg=None, seconds=3.0, fps=20,
                  model="birefnet-general-lite", center=None, zoom=1.0, eyes=None, blink="auto",
-                 seed=7, params=None, log=print):
+                 seed=7, params=None, log=print, analysis=None):
         self.log = log
         self.P = dict(DEFAULTS); self.P.update(params or {})
         st = STYLES.get(style, STYLES["portrait"])
@@ -245,19 +336,22 @@ class Animator:
         E = self.E = int(round(out * (1 + 2 * self.margin)))
         self.off = (E - out) // 2
 
-        # --- segment on a working copy (long side <= 1024)
+        # --- slow analysis (segmentation, eye detectors) on a working copy (long side <= 1024).
+        # An Analysis can be passed in (e.g. loaded from a prep cache) so re-exports skip it.
         src = src_rgb
         H0, W0 = src.shape[:2]
-        sc = min(1.0, 1024 / max(H0, W0))
-        work = cv2.resize(src, (int(W0 * sc), int(H0 * sc)), interpolation=cv2.INTER_AREA) if sc < 1 else src
-        mask_w = segment(work, model)
+        if analysis is None:
+            analysis = Analysis(src, log=log)
+        self.analysis = analysis
+        sc, work = analysis.sc, analysis.work
+        mask_w = analysis.mask(model)
         mask_full = cv2.resize(mask_w, (W0, H0), interpolation=cv2.INTER_LINEAR)
         self.mask_cover = float((mask_w > 0.5).mean())
 
         # --- face (for crop) on the working copy
         face_eyes, face_box = ([], None)
         if "blink" in self.subj and blink in ("auto", "face"):
-            face_eyes, face_box = detect_face_eyes(work)
+            face_eyes, face_box = analysis.face()
 
         # --- choose crop square (source px)
         ys, xs = np.nonzero(mask_full > 0.5)
@@ -326,13 +420,15 @@ class Animator:
             if eyes:
                 self.eyes = eyes_from_boxes([(self.off + x * out, self.off + y * out, w * out, h * out)
                                              for (x, y, w, h) in eyes], E)
+                for e in self.eyes:
+                    e["src"] = "manual"
             if face_eyes and not self.eyes:
                 for e in face_eyes:
                     p = e["poly"] / sc
                     p = np.stack([s * p[:, 0] + M[0, 2], s * p[:, 1] + M[1, 2]], 1)
                     self.eyes.append(dict(kind="photo", poly=p.astype(np.float32)))
             if not self.eyes and blink in ("auto", "pet"):
-                for p in detect_pet_eyes(work):
+                for p in analysis.pet():
                     p = p / sc
                     p = np.stack([s * p[:, 0] + M[0, 2], s * p[:, 1] + M[1, 2]], 1)
                     self.eyes.append(dict(kind="photo", poly=p.astype(np.float32), src="pet"))
@@ -350,10 +446,32 @@ class Animator:
         # so soft edges carry no halo of the filled background (and no old-background fringe on new backdrops)
         a3 = self.alpha[..., None]
         self.fg = np.where(a3 > 0.02, np.clip((self.img - (1 - a3) * self.bg) / np.maximum(a3, 0.02), 0, 1), self.img).astype(np.float32)
+        self.bg_fill = self.bg   # filled background before any backdrop replacement (for previews)
         self._prep_backdrop()
         self._prep_blink()
         self._prep_swirl()
         self._prep_sparkles()
+
+    # ------------------------------------------------------------ inspection
+    def eye_boxes(self):
+        """Eyes as (cx, cy, w, h) fractions of the output square: the same format as --eyes / run(eyes=...)."""
+        boxes = []
+        for e in self.eyes:
+            if e["kind"] == "cartoon":
+                ys, xs = np.nonzero(e["mask"])
+                x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+            else:
+                x0, y0 = e["poly"].min(0); x1, y1 = e["poly"].max(0)
+            boxes.append(tuple(round(float(v), 4) for v in (
+                ((x0 + x1) / 2 - self.off) / self.out, ((y0 + y1) / 2 - self.off) / self.out,
+                (x1 - x0) / self.out, (y1 - y0) / self.out)))
+        return boxes
+
+    def eye_source(self):
+        """Which detector produced the eyes: manual, face, pet, cartoon or none."""
+        if not self.eyes:
+            return "none"
+        return self.eyes[0].get("src", self.eyes[0]["kind"] if self.eyes[0]["kind"] == "cartoon" else "face")
 
     # ------------------------------------------------------------ preparation
     def _prep_backdrop(self):

@@ -35,6 +35,23 @@ Use `avatar.webp` when the destination accepts WebP: it stays at 512 px and is u
 `avatar.gif` works everywhere. If a photo's GIF would go over the budget, it is automatically shrunk to 448 or
 384 px. `report.json` lists the final sizes, dimensions, whether eyes were found, and a seamless-loop check.
 
+### Prepare once, re-export fast
+
+The slow analysis (background removal, face and cat-eye detection) is cached in `<out>/prep/`. Run again with
+the same `-o` and it is reused, so changing `--eyes`, motions or `--set` values skips segmentation.
+
+```bash
+# 1. slow step only: mask, crop, background fill, eye detection (about 10 s cold, under 1 s when cached)
+.venv/bin/python animate.py my-photo.jpg --style pet -o out/me --prepare-only
+# -> out/me/prep/preview.png (crop with the detected eyes outlined and numbered), prep.json,
+#    subject.png + background.png (layers on the padded canvas)
+# 2. fix the eyes if needed (prep.json "eyes_arg" is in the same format), then export
+.venv/bin/python animate.py my-photo.jpg --style pet -o out/me --eyes "0.35,0.55,0.12,0.11;0.61,0.58,0.13,0.10"
+```
+
+`prep.json` also lists the crop as `--center`/`--zoom` values and which detector found the eyes
+(`eye_source`: face, pet, cartoon, manual or none). `--no-cache` turns the cache off.
+
 ## Styles
 
 | `--style` | for | subject motions | background motions |
@@ -63,6 +80,8 @@ Use `avatar.webp` when the destination accepts WebP: it stays at 512 px and is u
 | `--size 512` | output size in px |
 | `--model birefnet-general-lite` | mask model: `birefnet-general-lite` (default), `birefnet-general`, `u2net`, `isnet-general-use` |
 | `--set key=value` | tune a motion (repeatable), e.g. `--set tilt_deg=6 --set swirl_deg=50` |
+| `--prepare-only` | run only the slow step and write `<out>/prep/` (no frames, no encoding) |
+| `--no-cache` | don't read or write the `<out>/prep/` analysis cache |
 
 More examples:
 
@@ -100,6 +119,11 @@ space scene: `space`). Check `out/avatar/report.json`: if `eyes` is empty and th
 This is a small local page, standard library only. Upload an image, pick a style or motions, then download the
 GIF/WebP and see 96/48/32 px previews. Jobs are stored in `webui-jobs/`. It listens on localhost only.
 
+It also has two JSON endpoints for editors and bots: `POST /prepare` (multipart upload, same fields as the form)
+runs only the slow step and returns the crop, the detected eyes and links to the preview and layer PNGs;
+`POST /export` with `{"job": ..., "eyes": "cx,cy,w,h;cx,cy,w,h"}` (plus optional `style`, `subject`, `bg`,
+`seconds`, `fps`, `blink`, `params`) renders from the job's cache. See the docstring at the top of `webui.py`.
+
 ## How it works
 
 ```
@@ -116,7 +140,8 @@ image ─► subject mask (BiRefNet-lite via rembg) ─► square crop on the su
 ./run_tests.sh
 ```
 
-This renders the four CC0 sample images in `test-images/` and checks the size budget and the seamless loop
+This runs the unit tests in `tests/` (prepare/export split, cache reuse, eye round-trip, CLI and web endpoints),
+then renders the four CC0 sample images in `test-images/` and checks the size budget and the seamless loop
 for each one.
 
 ## Limitations
