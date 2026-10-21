@@ -7,6 +7,18 @@ API key, and model weights download automatically on first run.
 It works on photos of people, pets, logos and illustrations: the subject breathes, tilts, floats and blinks,
 and the background drifts, swirls or sparkles.
 
+When the automatic result is off, you can fix it without redoing the slow part:
+
+* **Eyes:** place them by naming cells on a grid (works from a chat) or by clicking them in the browser editor,
+  and choose how each one blinks (cartoon squash or photo eyelid). Dogs, side profiles and odd mascots need this.
+* **Cut-out:** check `prep/mask.png` and switch to the full cut-out model if parts of the subject are missing.
+* **Crop:** drag and zoom the square in the editor, or pass `--center`/`--zoom`.
+* **Motion:** tune float, breathe, tilt, blink and background drift with sliders on a live preview that plays in
+  the browser, so nothing is rendered until you export.
+
+The slow analysis (background removal and eye detection) runs once per image and is cached, so every fix after
+that re-exports in seconds.
+
 ## Install (Linux, Python 3.10+)
 
 ```bash
@@ -134,19 +146,44 @@ the swirl into a tilted disk), `swirl_tilt` 0, `hue_deg` 40, `sweep_strength` 0.
 
 ## Using it from an AI agent / bot
 
-A bot running on its own Linux computer can do the whole flow with these commands:
+A bot running on its own Linux computer (a Grok Bot's computer, for example) can do the whole flow itself, so the
+person it works for doesn't install anything:
 
 ```bash
 git clone https://github.com/plaskettmj/avatar-animator.git && cd avatar-animator && ./install.sh
-.venv/bin/python animate.py /path/to/input.jpg --style portrait -o out/avatar
+# 1. slow step only (cached in out/avatar/prep/)
+.venv/bin/python animate.py /path/to/input.jpg --style pet -o out/avatar --prepare-only
+# 2. render and encode, reusing the cache (add --eyes-at, --center/--zoom or --set from the user's fixes)
+.venv/bin/python animate.py /path/to/input.jpg --style pet -o out/avatar
 # then upload out/avatar/avatar.gif (or avatar.webp) as the new avatar; both are < 5 MB
 ```
 
 Pick the style that matches the image (person: `portrait`, animal: `pet`, logo/icon: `logo`, illustration or
-space scene: `space`). Check `out/avatar/report.json`: if `eyes` is empty and the subject has eyes, send the
-user `out/avatar/prep/grid.png`, ask which cells the eyes are in and rerun with `--eyes-at "D5,G5"`, or use
-`--blink off`. For cartoons and logos, `eyes` should say `cartoon`: `photo` eyes on a drawing blink by sliding the
-eyebrows down (pass `--eye-kind cartoon`). Look at `contact-sheet.png` before uploading.
+space scene: `space`). After the prepare step, look at `prep/preview.png` and `prep/prep.json` (or
+`report.json` after an export):
+
+* **No eyes found, or the user says they're wrong.** If `eyes` is empty and the subject has eyes (typical for
+  dogs, side profiles and unusual mascots), offer to place them. Offer the chat grid first, because it needs
+  nothing but the chat:
+  1. *Chat grid (default):* send the user `prep/grid.png`, ask which cells the eyes are in ("D5 and G5"),
+     export with `--eyes-at "D5,G5"`, and check `eyes.png` (or `report.json` → `eye_details[*].grabbed`)
+     before sending the result.
+  2. *Browser editor (option):* run `.venv/bin/python webui.py` and open `http://127.0.0.1:8765/editor` in
+     the browser on the bot's own computer. The page listens on localhost only, so the user watches or drives it
+     on the bot's desktop (a Grok Bot's owner can open its desktop to watch or help); never expose the port to
+     the internet. There they click the eyes, press Test blink, drag or zoom the crop and tune the live-preview
+     sliders, then Export. Results are saved in `webui-jobs/<job>/` (`avatar.gif`, `avatar.webp`,
+     `report.json`).
+
+  If they'd rather it didn't blink, export with `--blink off`.
+* **Blink style.** For cartoons and logos, `eyes` should say `cartoon`: `photo` eyes on a drawing blink by
+  sliding the eyebrows down (pass `--eye-kind cartoon`, or `D5:cartoon` per eye).
+* **Parts missing from the cut-out** (`prep/mask.png`): re-run with `--model birefnet-general`.
+* **Crop cuts the subject or sits off-centre:** adjust `--center`/`--zoom`, starting from `crop.args` in
+  `prep.json`, or have the user drag the crop in the editor.
+* **More or less motion:** `--set` (for example `--set tilt_deg=6`), or the editor's live-preview sliders.
+
+Look at `contact-sheet.png` before uploading. It includes a mid-blink frame whenever the eyes blink.
 
 ## Web UI (optional)
 
@@ -207,8 +244,11 @@ image ─► subject mask (BiRefNet-lite via rembg) ─► square crop on the su
 This runs the unit tests in `tests/` (prepare/export split, cache reuse, eye round-trip, eye grabbing and blink
 styles, grid cells, crop clamping and re-cropping, live-preview layers and the browser motion math checked against the renderer under node,
 CLI and web endpoints),
-then renders the four CC0 sample images in `test-images/` and checks the size budget and the seamless loop
-for each one.
+then a golden test (`tests/golden_manual_eyes.py`) that renders the cat sample with only the human face
+detector, so no eyes are found and nothing blinks, then places the eyes by hand (`--eyes` on the command line and
+`eyes=` in Python) and checks that the encoded blink frame differs from the open frame inside the eyes and
+nowhere else. Finally it renders the four CC0 sample images in `test-images/` and checks the size budget and the
+seamless loop for each one.
 
 ## Limitations
 
