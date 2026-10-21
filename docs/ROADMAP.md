@@ -36,7 +36,8 @@
 * **Motion is rigid:** float, tilt and breathe, plus blink. There is no mesh warping or gaze movement yet.
 
 ## Roadmap
-1. Live preview in the browser (in progress).
+1. Live preview in the browser (done). Upload a photo, see the cropped avatar animating within seconds, fix the
+   eyes, crop and motion, and encode only on Export.
    * Step 1 (done): the slow prepare step (mask, crop, fill, eyes) is split from export and cached per output
      folder / web job (`--prepare-only`, `/prepare`, `/export`).
    * Step 2 (done): eye editor. Chat path (`prep/grid.png` + `--eyes-at`) and browser editor (`/editor`: click
@@ -50,11 +51,18 @@
      smeared (the auto crop is clamped too); re-cropping reuses the cached cut-out. The full BiRefNet session
      runs without ONNX Runtime's CPU memory arena, so repeated full-model Prepares in one web UI process stay
      at about 8 GB peak instead of growing to 14 GB.
-   * Step 5: template skill wiring, docs, golden tests.
-2. Manual corrections: drag the crop square (step 4), paint the mask, draw the swirl ellipse.
+   * Step 5 (done): docs and the bot flow. The README describes how a bot offers eye placement when
+     `report.json` shows no eyes: the chat grid by default, the browser editor on the bot's own desktop as an
+     option, plus the live-preview sliders and crop drag. A golden test (`tests/golden_manual_eyes.py`, run by
+     `run_tests.sh`) renders a sample where no eyes are detected, places them with `--eyes` / `eyes=`, and
+     checks that the encoded blink frame changes inside the eyes and nowhere else.
+2. Manual corrections: paint the mask, draw the swirl ellipse. (Eye placement and crop drag shipped with the live
+   preview.)
 3. Permissive model upgrades: BiRefNet full/HR (MIT) for hair, LaMa (Apache-2.0) for background fill, MediaPipe
    iris/blendshapes for gaze, and a permissively licensed pet keypoint model for dogs.
 4. Export options: APNG, MP4/WebM loops, a small sidebar-optimised variant with stronger motion, and a size-budget
    search (fps × size × lossy) instead of the fixed ladder.
-5. Tests: a golden-image suite (faces, pets and logo edge cases) checking seam, size budget and per-motion
-   visibility at small sizes.
+5. Tests: grow the golden suite (started with the manual-eye blink test) to faces, dogs, profiles and logo edge
+   cases, checking seam, size budget and per-motion visibility at small sizes. The sample set has no dog or
+   side-profile photo yet; a CC0 one would let the golden test use a real detector miss instead of limiting the
+   cat to the face detector.
