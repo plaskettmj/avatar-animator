@@ -6,7 +6,11 @@ JSON endpoints (used by the eye editor; bots can call them too):
   POST /prepare  multipart form (image + the page's fields, plus "model" and "eye_kind") -> {"job", "prep",
                  "urls"}: the slow step only (mask, crop, background fill, eye detection). Or JSON {"job",
                  "model", "style", "eye_kind"} to re-prepare an existing job (e.g. switch the cut-out model;
-                 the first run of a model is slow, later ones are cached). prep.eyes[*].src is each eye in
+                 the first run of a model is slow, later ones are cached). JSON may also set the crop: "center"
+                 [x, y] (fractions of the source image) and "zoom" (1 = the image's short side), or "auto_crop":
+                 true; the square is kept inside the image. Re-cropping skips segmentation and eye detection (only
+                 the crop and background fill run) and keeps the eyes, which are stored in source px. The crop is
+                 saved with the job, so /eyes, /preview and /export use it. prep.eyes[*].src is each eye in
                  source-image px (stays valid when the crop changes); prep.eyes[*].box is in output fractions.
   POST /eyes     JSON {"job", "eyes": [{"x", "y", "w"?, "h"?, "kind"?}, ...] (source px), "test_blink": bool}
                  -> {"eyes": [...resolved...], "urls": {"blink": strip PNG}}. Eyes without w/h are grabbed: the
@@ -80,7 +84,7 @@ class H(BaseHTTPRequestHandler):
         if path.startswith("/jobs/"):
             p = os.path.normpath(os.path.join(ROOT, path[len("/jobs/"):]))
             if p.startswith(ROOT) and os.path.isfile(p):
-                ct = {"gif": "image/gif", "webp": "image/webp", "png": "image/png", "json": "application/json"}.get(p.rsplit(".", 1)[-1], "application/octet-stream")
+                ct = {"gif": "image/gif", "webp": "image/webp", "png": "image/png", "jpg": "image/jpeg", "json": "application/json"}.get(p.rsplit(".", 1)[-1], "application/octet-stream")
                 return self._send(200, open(p, "rb").read(), ct)
         self._send(404, "not found", "text/plain")
 
@@ -112,7 +116,7 @@ class H(BaseHTTPRequestHandler):
         return {n: f"/jobs/{job}/{n}" for n in names if os.path.isfile(os.path.join(ROOT, job, n))}
 
     PREP_FILES = ["prep/" + f for f in ("preview.png", "crop.png", "grid.png", "mask.png", "subject.png",
-                                        "background.png", "prep.json")]
+                                        "background.png", "prep.json", "source.jpg")]
 
     def _body_json(self):
         return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -142,7 +146,23 @@ class H(BaseHTTPRequestHandler):
         if st.get("style") not in STYLES: st.pop("style", None)
         if st.get("model") not in MODELS: st.pop("model", None)
         if st.get("eye_kind") not in EYE_KINDS: st.pop("eye_kind", None)
+        try:   # crop: centre as source fractions in [0, 1], zoom >= 1 (the square never grows past the image)
+            c = st.get("center")
+            st["center"] = None if c is None else [min(max(float(c[0]), 0.0), 1.0), min(max(float(c[1]), 0.0), 1.0)]
+            st["zoom"] = min(max(float(st.get("zoom", 1.0)), 1.0), 20.0)
+        except (TypeError, ValueError, IndexError):
+            st["center"], st["zoom"] = None, 1.0
+        if st["center"] is None and st["zoom"] == 1.0:
+            st.pop("center"); st.pop("zoom")   # auto crop
         return st
+
+    @staticmethod
+    def _source_preview(d):
+        """prep/source.jpg: the whole input (long side <= 1280) for the editor's crop drag."""
+        p = os.path.join(d, "prep", "source.jpg")
+        if not os.path.exists(p):
+            im = Image.open(os.path.join(d, "input")).convert("RGB"); im.thumbnail((1280, 1280))
+            os.makedirs(os.path.dirname(p), exist_ok=True); im.save(p, quality=90)
 
     def _prepare(self):
         if self.headers.get("Content-Type", "").startswith("application/json"):
@@ -154,8 +174,10 @@ class H(BaseHTTPRequestHandler):
             if not job:
                 return self._json(404, dict(error="unknown job"))
             settings = self._settings(d)
-            for k in ("style", "model", "eye_kind", "subject", "bg"):
+            for k in ("style", "model", "eye_kind", "subject", "bg", "center", "zoom"):
                 if k in req: settings[k] = req[k]
+            if req.get("auto_crop"):
+                settings.pop("center", None); settings.pop("zoom", None)
             src = os.path.join(d, "input")
         else:
             fields, img = self._form()
@@ -168,6 +190,7 @@ class H(BaseHTTPRequestHandler):
         settings = self._clean(settings)
         try:
             prep = prepare(src, d, **settings)
+            self._source_preview(d)
         except Exception as e:
             return self._json(500, dict(error=str(e)))
         self._save_settings(d, settings)
@@ -209,6 +232,7 @@ class H(BaseHTTPRequestHandler):
         elif force_blink and "blink" not in subj:
             subj.append("blink")
         return Animator(src, style=style, subject=subj, bg=bg, model=st.get("model", "birefnet-general-lite"),
+                        center=st.get("center"), zoom=st.get("zoom", 1.0),
                         eyes=eyes, eye_kind=st.get("eye_kind", "auto"), analysis=ana, log=lambda *a, **k: None)
 
     @staticmethod
@@ -222,7 +246,9 @@ class H(BaseHTTPRequestHandler):
                 c = cv2.approxPolyDP(max(cs, key=cv2.contourArea), 1.0, True)[:, 0, :].astype(float)
                 r["outline"] = [[round(v, 1) for v in an.canvas_to_src(x, y)] for x, y in c]
             res.append(r)
-        return res
+        # eyes the crop leaves out: kept (source px) so the editor still has them when the crop moves back
+        res += [dict(e, grabbed=False, off_crop=True) for e in getattr(an, "eyes_off", [])]
+        return sorted(res, key=lambda r: r["x"])
 
     def _eyes(self):
         """Resolve eyes (grab shapes, pick blink styles) and optionally render a blink test strip."""
@@ -274,7 +300,7 @@ class H(BaseHTTPRequestHandler):
         if not job:
             return self._json(404, dict(error="unknown job"))
         settings = self._settings(d)
-        for k in ("style", "subject", "bg", "blink", "model", "eye_kind"):
+        for k in ("style", "subject", "bg", "blink", "model", "eye_kind", "center", "zoom"):
             if k in req: settings[k] = req[k]
         settings = self._clean(settings)
         if req.get("no_blink"):

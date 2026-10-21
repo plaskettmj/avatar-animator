@@ -192,7 +192,11 @@ def _write_prep(an, path, src, outdir, model, center, zoom, blink, t0):
         crop=dict(cx=round(float(cx), 2), cy=round(float(cy), 2), side=round(float(side), 2),
                   # --center/--zoom values that reproduce this crop
                   center=[round(float(cx) / W0, 4), round(float(cy) / H0, 4)],
-                  zoom=round(min(W0, H0) / float(side), 4)),
+                  zoom=round(min(W0, H0) / float(side), 4),
+                  args=f"--center {float(cx) / W0:.4f},{float(cy) / H0:.4f} --zoom {min(W0, H0) / float(side):.4f}",
+                  # True when the requested / auto crop would have passed the image border and was pulled inside
+                  clamped=bool(an.crop_clamped), auto=center is None and zoom == 1.0),
+        source=dict(width=W0, height=H0),
         canvas=dict(size=an.E, offset=o, out=out),   # subject/background PNGs are canvas-sized; visible square = [offset, offset+out)
         anchored=bool(an.anchored), mask_cover=round(an.mask_cover, 3),
         illustration=round(an.illustration, 3), eye_kind=an.eye_kind,
@@ -302,6 +306,9 @@ def export(path, outdir, style="portrait", subject=None, bg=None, seconds=3.0, f
     report = dict(input=path, style=style, subject_motions=an.subj, bg_motions=an.bgm,
                   model=model, eyes=[e["kind"] for e in an.eyes], eye_source=an.eye_source(), eyes_arg=eyes_arg(boxes),
                   eyes_src_arg=format_eye_specs(an.eye_specs()), eye_details=_eyes_json(an, boxes),
+                  crop=dict(cx=round(float(an.crop[0]), 2), cy=round(float(an.crop[1]), 2), side=round(float(an.crop[2]), 2),
+                            args=f"--center {an.crop[0] / an.src_size[0]:.4f},{an.crop[1] / an.src_size[1]:.4f} "
+                                 f"--zoom {min(an.src_size) / an.crop[2]:.4f}", clamped=bool(an.crop_clamped)),
                   anchored=bool(an.anchored), frames=N, fps=fps,
                   params={k: v for k, v in an.P.items() if DEFAULTS.get(k) != v},
                   seconds=seconds, gif=export_mod.check_file(base + ".gif"), webp=export_mod.check_file(base + ".webp"),
@@ -332,8 +339,10 @@ def main():
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--model", default="birefnet-general-lite", choices=MODELS,
                     help="cut-out model; birefnet-general is slower (~30 s, ~8 GB RAM peak) but keeps headsets, props and bodies")
-    ap.add_argument("--center", help="crop center as fractions x,y of the source image (e.g. 0.43,0.47)")
-    ap.add_argument("--zoom", type=float, default=1.0, help=">1 crops tighter")
+    ap.add_argument("--center", help="crop center as fractions x,y of the source image (e.g. 0.43,0.47); the crop "
+                                     "square is kept inside the image, so it is moved in from the edges if needed")
+    ap.add_argument("--zoom", type=float, default=1.0, help=">1 crops tighter (1 = the image's short side; the "
+                                                             "crop never grows past the image)")
     ap.add_argument("--eyes", help="manual eyes in output fractions 'cx,cy,w,h[,kind];...' (tied to this crop)")
     ap.add_argument("--eyes-src", help="manual eyes in source-image px 'x,y[,w,h][,kind];...'; without w,h the eye "
                                        "shape is found around the point. Survives crop/zoom/style changes")

@@ -171,8 +171,18 @@ the export will sample (same fps and loop length), and Export uses the slider va
 sparkles, twinkle, swirl, hue and sweep need the full renderer, so the preview shows them as they look at t=0
 and labels them; Export animates them. Eye edits refresh the preview layers in about half a second.
 
+**Crop:** drag the live preview to move the crop (the picture follows the pointer) and scroll on it, or use the
+Zoom slider, to zoom. While you drag, the preview shows the source image under the new crop; on release the
+server re-crops in about a second (the cut-out is cached, so only the crop and background fill run) and the
+preview carries on with your sliders. The crop always stops at the image edges, so the border is never smeared,
+and the small overview shows where the crop sits in the whole image. "Auto crop" goes back to the automatic
+framing. Eyes stay where you put them; an eye the crop leaves out is kept (listed as outside the crop) and blinks
+again when the crop moves back. The same crop from the command line is `--center x,y --zoom z`; `prep.json`
+and `report.json` print it as `crop.args`.
+
 JSON endpoints for editors and bots (details in the docstring at the top of `webui.py`): `POST /prepare`
-(multipart upload, or JSON `{"job", "model", "style"}` to re-prepare a job), `POST /eyes` (resolve clicked
+(multipart upload, or JSON `{"job", "model", "style"}` to re-prepare a job, plus `"center"`/`"zoom"` or
+`"auto_crop": true` to re-crop it), `POST /eyes` (resolve clicked
 points into eyes, optional blink test strip), `POST /preview` (the layers the live preview animates: frozen
 background, subject, eye patches closing in steps) and `POST /export` (eyes in source pixels or any CLI format,
 plus `params`, `subject`, `bg`, `seconds` from the sliders).
@@ -195,7 +205,7 @@ image ─► subject mask (BiRefNet-lite via rembg) ─► square crop on the su
 ```
 
 This runs the unit tests in `tests/` (prepare/export split, cache reuse, eye round-trip, eye grabbing and blink
-styles, grid cells, live-preview layers and the browser motion math checked against the renderer under node,
+styles, grid cells, crop clamping and re-cropping, live-preview layers and the browser motion math checked against the renderer under node,
 CLI and web endpoints),
 then renders the four CC0 sample images in `test-images/` and checks the size budget and the seamless loop
 for each one.

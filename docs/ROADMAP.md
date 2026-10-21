@@ -22,10 +22,12 @@
 * **Background fill:** OpenCV Telea inpainting at quarter resolution. It's fine for the small reveals the motions
   make, but large moves show smeary fill. The fill band around the subject is visible even at rest, so parts the
   cut-out misses (a headset next to a head) look smeared; use `--model birefnet-general` or, later, mask painting.
-* **Framing:** a heuristic crop (face box ×2.6, otherwise the subject bbox); `--center` and `--zoom` override it.
-  When the crop is larger than the image (app icons with the logo style, zoom < 1) the edge pixels are smeared
-  into the border; use `--center 0.5,0.5 --zoom 1` until crop drag (live-preview step 4) clamps it.
-  Subjects that touch the image edge get their edge pixels replicated, and long replications can look streaky.
+* **Framing:** a heuristic crop (face box ×2.6, otherwise the subject bbox); `--center` and `--zoom`, or dragging
+  the crop in the editor, override it. The crop square always stays inside the image (at most the short side),
+  so a style that wants more room around the subject than the image has (the logo style on app icons) gets the
+  whole image rather than a smeared border; a subject wider than the image's short side is cut at the sides.
+  Subjects that touch the image edge get their edge pixels replicated into the motion margin, and long
+  replications can look streaky.
 * **Segmentation edges:** there's no colour decontamination, so a faint fringe of the old background can move with
   the subject on high-contrast edges.
 * **Live preview:** particles, sparkles, twinkle, swirl, hue and sweep are shown still in the editor's preview
@@ -44,7 +46,10 @@
      from the `/preview` layers with the renderer's own motion math (checked against it under node), so the
      sliders update instantly and encoding happens only on Export. Swirl, hue, twinkle, particles, sparkles and
      sweep are shown still (as at t=0) and labelled. Blink is previewed in 8 steps.
-   * Step 4: crop drag and zoom, clamped to the image so the border is never smeared.
+   * Step 4 (done): crop drag and zoom on the live preview, clamped to the image so the border is never
+     smeared (the auto crop is clamped too); re-cropping reuses the cached cut-out. The full BiRefNet session
+     runs without ONNX Runtime's CPU memory arena, so repeated full-model Prepares in one web UI process stay
+     at about 8 GB peak instead of growing to 14 GB.
    * Step 5: template skill wiring, docs, golden tests.
 2. Manual corrections: drag the crop square (step 4), paint the mask, draw the swirl ellipse.
 3. Permissive model upgrades: BiRefNet full/HR (MIT) for hair, LaMa (Apache-2.0) for background fill, MediaPipe

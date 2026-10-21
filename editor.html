@@ -15,6 +15,7 @@ fieldset{border:1px solid #444;margin:.5em 0}
 .mirror{border-radius:50%;vertical-align:middle;margin-right:8px;background:#222}
 #sliders{flex:1;min-width:300px} #sliders label.sl{display:grid;grid-template-columns:9em 1fr 4em;gap:.5em;align-items:center;margin:.25em 0}
 #sliders input[type=range]{width:100%} .frozen{color:#fd6}
+#pv{cursor:grab;touch-action:none} #pv.dragging{cursor:grabbing} #overview{border-radius:6px;background:#222;vertical-align:top}
 </style>
 <script src=/preview.js></script>
 <h1>Eye editor</h1>
@@ -44,6 +45,11 @@ Cut-out <select id=model><option value=birefnet-general-lite>fast (lite)</option
   <canvas id=pv width=512 height=512></canvas><br>
   <canvas class=mirror id=m96 width=96 height=96></canvas><canvas class=mirror id=m48 width=48 height=48></canvas><canvas class=mirror id=m32 width=32 height=32></canvas>
   <span class=muted>sidebar sizes</span>
+  <p><b>Crop</b> <span class=muted>drag the preview to move it, scroll to zoom</span><br>
+  <canvas id=overview width=160 height=160 title="whole image; the box is the crop"></canvas>
+  <span style="display:inline-block;width:200px;vertical-align:top;margin-left:8px">
+   Zoom <input type=range id=zoom min=1 max=6 step=0.05 value=1 style="width:120px"> <span id=zoomv class=muted></span><br>
+   <button id=autocrop>Auto crop</button><br><span class=muted id=cropinfo></span></span></p>
  </div>
  <div id=sliders>
   <p><button id=play>Pause</button> <input type=range id=scrub min=0 max=1 step=0.001 value=0 style="width:12em" title="loop time (pauses)"> <span id=tlabel class=muted></span></p>
@@ -64,6 +70,7 @@ const KINDS = ["auto", "cartoon", "photo"];
 const pv = new AvatarPreview.LivePreview($("pv"), [$("m96"), $("m48"), $("m32")]);
 window.livePreview = pv;   // for scripted checks
 let live = null, motionState = null, pvBusy = false, pvPending = false;
+let crop = null, imgSrc = new Image(), cropDrag = null, cropBusy = false, cropPending = null, wheelTimer = 0, wheelWasPlaying = false;
 const SUBJ_TOGGLES = ["float", "breathe", "tilt", "sweep"];
 const BG_TOGGLES = ["parallax", "particles", "sparkles", "twinkle", "swirl", "hue", "backdrop"];
 const SLIDERS = [  // key, label, min, max, step, format
@@ -114,7 +121,7 @@ function renderList() {
   eyes.forEach((e, i) => {
     const d = document.createElement("div"); d.className = "eye" + (i === sel ? " sel" : "");
     d.innerHTML = `<b>Eye ${i + 1}</b> blink <select>${KINDS.map(x => `<option ${x === (e.want || e.kind) ? "selected" : ""}>${x}</option>`).join("")}</select>
-      <button>delete</button> <span class=muted>${Math.round(e.x)},${Math.round(e.y)} ${Math.round(e.w)}×${Math.round(e.h)} px${e.grabbed ? " · shape found" : ""}</span>`;
+      <button>delete</button> <span class=muted>${Math.round(e.x)},${Math.round(e.y)} ${Math.round(e.w)}×${Math.round(e.h)} px${e.grabbed ? " · shape found" : ""}${e.off_crop ? " · <span class=frozen>outside the crop (kept, no blink)</span>" : ""}</span>`;
     d.querySelector("select").onchange = ev => { e.want = ev.target.value; sel = i; resolve(); };
     d.querySelector("button").onclick = () => { eyes.splice(i, 1); sel = -1; draw(); resolve().catch(e => status("Failed: " + e.message)); };
     d.onclick = () => { sel = i; draw(); };
@@ -213,19 +220,111 @@ function buildSliders() {
 $("resetsl").onclick = () => { if (!live) return; Object.assign(pv.P, live.params); pv.setSeconds(live.seconds); buildSliders(); pv.dirty = true; };
 $("play").onclick = () => { if (pv.playing) { pv.pause(); $("play").textContent = "Play"; } else { pv.play(); $("play").textContent = "Pause"; } };
 $("scrub").oninput = () => { if (pv.playing) { pv.pause(); $("play").textContent = "Play"; } pv.render(pv.quantize(+$("scrub").value)); };
+// ---------------------------------------------------------------- crop drag + zoom (step 4)
+// While dragging, the preview shows the source image under the new crop (no server call); on release the server
+// re-crops (cached cut-out: only the crop and background fill run) and the live layers are rebuilt.
+function srcSize() { return [prep.source.width, prep.source.height]; }
+function setCrop(cx, cy, side) { const [W, H] = srcSize(); crop = AvatarPreview.clampCrop(cx, cy, side, W, H); }
+function drawCropView() {
+  const [cx, cy, side] = crop, [W] = srcSize(), k = imgSrc.naturalWidth / W, g = $("pv").getContext("2d");
+  g.setTransform(1, 0, 0, 1, 0, 0); g.imageSmoothingQuality = "high";
+  g.drawImage(imgSrc, (cx - side / 2) * k, (cy - side / 2) * k, side * k, side * k, 0, 0, $("pv").width, $("pv").height);
+  for (const m of [$("m96"), $("m48"), $("m32")]) { const c = m.getContext("2d"); c.clearRect(0, 0, m.width, m.height); c.drawImage($("pv"), 0, 0, m.width, m.height); }
+  cropUI();
+}
+function cropUI() {
+  if (!prep || !prep.source) return;
+  const [W, H] = srcSize(), ov = $("overview"), g = ov.getContext("2d"), f = Math.min(ov.width / W, ov.height / H);
+  const ox = (ov.width - W * f) / 2, oy = (ov.height - H * f) / 2, [cx, cy, side] = crop;
+  g.clearRect(0, 0, ov.width, ov.height); g.drawImage(imgSrc, ox, oy, W * f, H * f);
+  g.strokeStyle = "#0ef"; g.lineWidth = 2; g.strokeRect(ox + (cx - side / 2) * f, oy + (cy - side / 2) * f, side * f, side * f);
+  const z = Math.min(W, H) / side;
+  $("zoom").value = z; $("zoomv").textContent = z.toFixed(2) + "×";
+  $("cropinfo").textContent = `centre ${Math.round(cx)},${Math.round(cy)} · ${Math.round(side)} px`;
+}
+function pvPos(ev) { const r = $("pv").getBoundingClientRect(); return [(ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height]; }
+async function commitCrop(wasPlaying) {
+  if (!job || !crop) return;
+  const [W, H] = srcSize(), [cx, cy, side] = crop;
+  const body = {job, center: [cx / W, cy / H], zoom: Math.min(W, H) / side};
+  if (cropBusy) { cropPending = {body, wasPlaying}; return; }
+  cropBusy = true; status("Re-cropping (cut-out is cached; about a second)...");
+  try { await setPrep(await post("/prepare", body), true, true); }
+  catch (e) { status("Failed: " + e.message); }
+  finally {
+    cropBusy = false;
+    if (cropPending) { const p = cropPending; cropPending = null; return commitCrop(p.wasPlaying); }
+    if (wasPlaying !== false) { pv.play(); $("play").textContent = "Pause"; } else pv.render();
+  }
+}
+$("pv").onpointerdown = ev => {
+  if (!prep || !live || !crop) return;
+  const [u, v] = pvPos(ev);
+  cropDrag = {u, v, cx: crop[0], cy: crop[1], moved: false, wasPlaying: pv.playing};
+  pv.pause(); $("pv").classList.add("dragging"); $("pv").setPointerCapture(ev.pointerId);
+};
+$("pv").onpointermove = ev => {
+  if (!cropDrag) return;
+  const [u, v] = pvPos(ev), side = crop[2];
+  cropDrag.moved = true;
+  setCrop(cropDrag.cx - (u - cropDrag.u) * side, cropDrag.cy - (v - cropDrag.v) * side, side);   // content follows the pointer
+  drawCropView();
+};
+$("pv").onpointerup = () => {
+  if (!cropDrag) return;
+  const d = cropDrag; cropDrag = null; $("pv").classList.remove("dragging");
+  if (d.moved) commitCrop(d.wasPlaying); else if (d.wasPlaying) pv.play();
+};
+function zoomTo(z, u, v) {   // zoom keeping the source point under (u, v) of the preview fixed
+  const [W, H] = srcSize(), [cx, cy, side] = crop, ns = Math.min(W, H) / Math.min(Math.max(z, 1), 20);
+  const px = cx - side / 2 + u * side, py = cy - side / 2 + v * side;
+  setCrop(px - (u - 0.5) * ns, py - (v - 0.5) * ns, ns);
+}
+$("pv").addEventListener("wheel", ev => {
+  if (!prep || !live || !crop) return;
+  ev.preventDefault();
+  if (!wheelTimer) wheelWasPlaying = pv.playing;
+  pv.pause();
+  const [u, v] = pvPos(ev), [W, H] = srcSize();
+  zoomTo(Math.min(W, H) / crop[2] * Math.exp(-ev.deltaY * 0.0015), u, v); drawCropView();
+  clearTimeout(wheelTimer);
+  wheelTimer = setTimeout(() => { wheelTimer = 0; commitCrop(wheelWasPlaying); }, 350);
+}, {passive: false});
+$("zoom").oninput = () => {
+  if (!prep || !crop) return;
+  if (!$("zoom").dataset.wasPlaying) $("zoom").dataset.wasPlaying = pv.playing ? "1" : "0";
+  pv.pause(); zoomTo(+$("zoom").value, 0.5, 0.5); drawCropView();
+};
+$("zoom").onchange = () => { const w = $("zoom").dataset.wasPlaying !== "0"; delete $("zoom").dataset.wasPlaying; commitCrop(w); };
+$("autocrop").onclick = async () => {
+  if (!job) return;
+  const w = pv.playing; cropBusy = true; status("Auto crop...");
+  try { await setPrep(await post("/prepare", {job, auto_crop: true}), true, true); }
+  catch (e) { status("Failed: " + e.message); }
+  finally { cropBusy = false; if (w) pv.play(); }
+};
 pv.onframe = t => { $("tlabel").textContent = `t=${(t * pv.seconds).toFixed(2)} s`; if (pv.playing) $("scrub").value = t; };
-async function setPrep(r, keepEyes) {
+async function setPrep(r, keepEyes, keepPreview) {
   job = r.job; prep = r.prep;
-  await Promise.all([load(imgCrop, r.urls["prep/crop.png"]), load(imgMask, r.urls["prep/mask.png"])]);
+  await Promise.all([load(imgCrop, r.urls["prep/crop.png"]), load(imgMask, r.urls["prep/mask.png"]),
+                     r.urls["prep/source.jpg"] && !keepPreview ? load(imgSrc, r.urls["prep/source.jpg"]) : null]);
+  crop = [prep.crop.cx, prep.crop.cy, prep.crop.side];
   if (!keepEyes) eyes = prep.eyes.map(e => Object.assign({}, e.src, {kind: e.kind, want: "auto", grabbed: e.grabbed}));
   sel = -1; draw();
-  motionState = null;   // a new image or style starts from the style's motions
-  if (live) { live = null; pv.P = {}; }
+  if (!keepPreview) {
+    motionState = null;   // a new image or style starts from the style's motions
+    if (live) { live = null; pv.P = {}; }
+  }
   await resolve();
-  status(`Prepared in ${prep.prep_s} s · eyes from: ${prep.eye_source} · cut-out: ${prep.model}`);
+  cropUI();
+  status(`Prepared in ${prep.prep_s} s · eyes from: ${prep.eye_source} · cut-out: ${prep.model}` +
+         (prep.crop.clamped ? " · crop pulled in to the image edges" : ""));
 }
+let prepBusy = false;
 $("prep").onclick = async () => {
+  if (prepBusy) return;   // one prepare at a time (a style change while uploading would re-prepare the old job)
   const f = $("file").files[0];
+  prepBusy = true;
   try {
     if (f) {
       const fd = new FormData(); fd.append("image", f); fd.append("style", $("style").value); fd.append("model", $("model").value);
@@ -235,6 +334,7 @@ $("prep").onclick = async () => {
       status("Re-preparing..."); await setPrep(await post("/prepare", {job, style: $("style").value, model: $("model").value}), true);
     } else status("Choose an image first.");
   } catch (e) { status("Failed: " + e.message); }
+  finally { prepBusy = false; }
 };
 $("model").onchange = $("style").onchange = () => { if (job) $("prep").onclick(); };
 $("showmask").onchange = draw;
