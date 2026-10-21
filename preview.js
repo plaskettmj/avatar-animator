@@ -42,6 +42,11 @@
     const u = (t - P.blink_at) / P.blink_len;
     return 0 < u && u < 1 ? Math.pow(Math.sin(Math.PI * u), 0.6) : 0;
   }
+  // core.clamp_crop(): keep the crop square inside the W x H source (side <= short side, edges inside the image)
+  function clampCrop(cx, cy, side, W, H) {
+    side = Math.min(Math.max(side, 8), W, H);
+    return [Math.min(Math.max(cx, side / 2), W - side / 2), Math.min(Math.max(cy, side / 2), H - side / 2), side];
+  }
   // cv2 warps treat pixel centres as integers, canvas as integers + 0.5: shift so the two line up exactly
   function setCv2Transform(ctx, M) {
     const [a, b, e, c, d, f] = M;
@@ -138,6 +143,6 @@
     }
     pause() { this.playing = false; cancelAnimationFrame(this.raf); }
   }
-  const api = {LIVE, affineAbout, motion, subjectMatrix, parallaxMatrix, blinkAmount, LivePreview};
+  const api = {LIVE, clampCrop, affineAbout, motion, subjectMatrix, parallaxMatrix, blinkAmount, LivePreview};
   if (typeof module !== "undefined" && module.exports) module.exports = api; else root.AvatarPreview = api;
 })(typeof self !== "undefined" ? self : this);

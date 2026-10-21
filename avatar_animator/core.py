@@ -67,6 +67,16 @@ DEFAULTS = dict(
 
 # ----------------------------------------------------------------- segmentation
 _sessions = {}
+def _session_options():
+    """ONNX Runtime options for the cut-out models. The CPU memory arena is off: with it on, the full BiRefNet's
+    second run in the same process grew the arena from about 9 to 14 GB (the web UI was OOM-killed on a 16 GB box
+    on the second full-model Prepare); without it memory goes back to the OS after each run."""
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.enable_cpu_mem_arena = False
+    so.enable_mem_pattern = False
+    return so
+
 def segment(img_rgb_u8, model="birefnet-general-lite"):
     """Return soft subject mask in [0,1] (float32) using rembg (MIT) + chosen weights."""
     from rembg import new_session, remove
@@ -75,7 +85,7 @@ def segment(img_rgb_u8, model="birefnet-general-lite"):
         # (e.g. the web editor switching cut-out models) can exhaust a 16 GB machine
         _sessions.clear()
         import gc; gc.collect()
-        _sessions[model] = new_session(model)
+        _sessions[model] = new_session(model, sess_opts=_session_options())
     m = remove(Image.fromarray(img_rgb_u8), session=_sessions[model], only_mask=True)
     return np.asarray(m).astype(np.float32) / 255.0
 
@@ -431,6 +441,13 @@ def affine_about(px, py, angle_deg, scale, tx, ty):
 def tri(p):
     return np.sin(np.pi * p) ** 2
 
+def clamp_crop(cx, cy, side, W, H):
+    """Keep the visible crop square inside the source image: side at most the image's short side, centre moved so
+    no edge passes the border (past the border there are only replicated edge pixels, which look smeared).
+    preview.js clampCrop() mirrors this for the editor's crop drag."""
+    side = float(min(max(side, 8.0), W, H))
+    return (float(min(max(cx, side / 2), W - side / 2)), float(min(max(cy, side / 2), H - side / 2)), side)
+
 # ----------------------------------------------------------------- the animator
 class Animator:
     def __init__(self, src_rgb, out=512, style="portrait", subject=None, bg=None, seconds=3.0, fps=20,
@@ -495,10 +512,10 @@ class Animator:
             side = max(side, 0.25 * min(W0, H0)) / zoom
         else:
             cx, cy, side = W0 / 2, H0 / 2, min(W0, H0) / zoom
-        # keep the visible square inside the source when it fits (avoids showing padded content)
-        if side <= W0: cx = min(max(cx, side / 2), W0 - side / 2)
-        if side <= H0: cy = min(max(cy, side / 2), H0 - side / 2)
+        self.crop_wanted = (float(cx), float(cy), float(side))
+        cx, cy, side = clamp_crop(cx, cy, side, W0, H0)
         self.crop = (cx, cy, side)
+        self.crop_clamped = bool(np.abs(np.subtract(self.crop, self.crop_wanted)).max() > 0.5)
 
         # --- extract extended canvas E x E (margin around the visible square)
         s = out / side
@@ -576,6 +593,18 @@ class Animator:
                         refit.append(r)
                     if not guessed or all(r["grab"]["found"] for r in refit):
                         self.eyes = refit
+        # Manual eyes the crop leaves out entirely (zoomed in on one part of the image) can't blink; they are set
+        # aside in eyes_off (source px) so an editor can keep them for when the crop moves back.
+        self.eyes_off = []
+        off = [e for e in self.eyes if not self._on_canvas(e)]
+        self.eyes = [e for e in self.eyes if self._on_canvas(e)]
+        for e in off:
+            if "at" not in e:
+                continue   # a detected eye outside the crop: nothing to keep
+            ex, ey, ew, eh = e["at"]
+            sx, sy = self.canvas_to_src(ex, ey)
+            self.eyes_off.append(dict(x=round(float(sx), 1), y=round(float(sy), 1), w=round(ew / self.scale, 1),
+                                      h=round(eh / self.scale, 1), kind=e["kind"]))
         for e in self.eyes:
             e.setdefault("spec", self._spec_from_canvas(e))
         self.eyes.sort(key=lambda e: e["spec"]["x"])   # eye 1 = leftmost in the image
@@ -603,6 +632,12 @@ class Animator:
 
     def canvas_to_src(self, x, y):
         return (x - self.M[0, 2]) / self.scale, (y - self.M[1, 2]) / self.scale
+
+    def _on_canvas(self, e):
+        if e["kind"] == "cartoon":
+            return bool(e["mask"].any())
+        (x0, y0), (x1, y1) = e["poly"].min(0), e["poly"].max(0)
+        return x1 > 0 and y1 > 0 and x0 < self.E and y0 < self.E
 
     @staticmethod
     def _canvas_bbox(e):
@@ -660,6 +695,7 @@ class Animator:
         else:
             e = eyes_from_boxes([(cx, cy, box[0], box[1])], E)[0]
         e["src"], e["grab"] = src, info
+        e["at"] = (float(cx), float(cy), float(box[0]), float(box[1]))   # canvas centre and size, as resolved
         if given:
             sx, sy = self.canvas_to_src(cx, cy)
             e["spec"] = dict(x=round(float(sx), 1), y=round(float(sy), 1), w=round(float(box[0] / self.scale), 1),
